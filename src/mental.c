@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <unistd.h>
 
 #include "graphics/mental_tui.h"
 #include "server/mental_server.h"
@@ -7,6 +11,8 @@
 /* ---- P2P state -------------------------------------------------- */
 
 static MentalServer *g_server = NULL;
+
+/* ---- Commands --------------------------------------------------- */
 
 static void cmd_start_p2p(MentalTui *tui, int argc, char **argv, void *user)
 {
@@ -22,9 +28,10 @@ static void cmd_start_p2p(MentalTui *tui, int argc, char **argv, void *user)
         mentalTuiPrintf(tui, MT_BRED, "[p2p] failed to start");
         return;
     }
-    mentalServerPing(g_server);
-    mentalTuiPrintf(tui, MT_BGREEN, "[p2p] started, listening on %d",
-                    MENTAL_DISCOVERY_PORT);
+    int sent = mentalServerPing(g_server);
+    mentalTuiPrintf(tui, MT_BGREEN,
+                    "[p2p] started on %d, broadcast sent to %d interface(s)",
+                    MENTAL_DISCOVERY_PORT, sent);
 }
 
 static void cmd_stop_p2p(MentalTui *tui, int argc, char **argv, void *user)
@@ -47,13 +54,34 @@ static void cmd_peers(MentalTui *tui, int argc, char **argv, void *user)
         return;
     }
     mentalTuiPrintf(tui, MT_BCYAN, "[p2p] %d peer(s):", g_server->peer_count);
-    for (int i = 0; i < g_server->peer_count; i++) {
+    for (int i = 0; i < g_server->peer_count; i++)
         mentalTuiPrintf(tui, MT_WHITE, "  %s:%u",
                         g_server->peers[i].ip, g_server->peers[i].port);
+}
+
+static void cmd_connect(MentalTui *tui, int argc, char **argv, void *user)
+{
+    (void)user;
+    if (argc < 2) {
+        mentalTuiPrintf(tui, MT_BYELLOW, "usage: connect <ipv4>");
+        return;
+    }
+    if (!g_server) {
+        mentalTuiPrintf(tui, MT_YELLOW, "[p2p] not running; use start-p2p");
+        return;
+    }
+    if (mentalServerConnect(g_server, argv[1]) == 0) {
+        mentalTuiPrintf(tui, MT_BGREEN,
+                        "[p2p] unicast PING sent to %s:%d",
+                        argv[1], MENTAL_DISCOVERY_PORT);
+        mentalTuiPrintf(tui, MT_BBLACK, "[p2p] try 'peers' in ~1s");
+    } else {
+        mentalTuiPrintf(tui, MT_BRED,
+                        "[p2p] connect failed (invalid IP or send error)");
     }
 }
 
-/* ---- Log tailing ------------------------------------------------ */
+/* ---- Shell / logging -------------------------------------------- */
 
 static void cmd_logs(MentalTui *tui, int argc, char **argv, void *user)
 {
@@ -63,8 +91,6 @@ static void cmd_logs(MentalTui *tui, int argc, char **argv, void *user)
     snprintf(cmd, sizeof(cmd), "tail -n 50 -f '%s' 2>&1", path);
     mentalTuiSpawnShell(tui, cmd);
 }
-
-/* ---- Explicit shell passthrough --------------------------------- */
 
 static void cmd_shell(MentalTui *tui, int argc, char **argv, void *user)
 {
@@ -81,8 +107,6 @@ static void cmd_shell(MentalTui *tui, int argc, char **argv, void *user)
     }
     mentalTuiSpawnShell(tui, line);
 }
-
-/* ---- Sysinfo ---------------------------------------------------- */
 
 static void cmd_sysinfo(MentalTui *tui, int argc, char **argv, void *user)
 {
@@ -101,16 +125,18 @@ int main(void)
     if (!tui) return 1;
 
     mentalTuiRegisterBuiltins(tui);
-    mentalTuiRegister(tui, "start-p2p", "start peer discovery",     cmd_start_p2p, NULL);
-    mentalTuiRegister(tui, "stop-p2p",  "stop peer discovery",      cmd_stop_p2p,  NULL);
-    mentalTuiRegister(tui, "peers",     "list discovered peers",    cmd_peers,     NULL);
-    mentalTuiRegister(tui, "logs",      "logs [path] - tail file",  cmd_logs,      NULL);
-    mentalTuiRegister(tui, "shell",     "shell <cmd> - run command", cmd_shell,    NULL);
-    mentalTuiRegister(tui, "sysinfo",   "print system info",        cmd_sysinfo,   NULL);
+    mentalTuiRegister(tui, "start-p2p", "start peer discovery",       cmd_start_p2p, NULL);
+    mentalTuiRegister(tui, "stop-p2p",  "stop peer discovery",        cmd_stop_p2p,  NULL);
+    mentalTuiRegister(tui, "peers",     "list discovered peers",      cmd_peers,     NULL);
+    mentalTuiRegister(tui, "connect",   "connect <ipv4> - unicast",   cmd_connect,   NULL);
+    mentalTuiRegister(tui, "logs",      "logs [path] - tail file",    cmd_logs,      NULL);
+    mentalTuiRegister(tui, "shell",     "shell <cmd> - run command",  cmd_shell,     NULL);
+    mentalTuiRegister(tui, "sysinfo",   "print system info",          cmd_sysinfo,   NULL);
 
     mentalTuiRun(tui);
+    int code = tui->exit_code;
     mentalTuiDestroy(tui);
 
     if (g_server) mentalServerDestroy(g_server);
-    return 0;
+    return code;
 }

@@ -4,6 +4,7 @@
 /*
  * mental_tui.h — command-driven ANSI TUI with shell & process integration.
  * Requires: POSIX (FreeBSD/Linux/macOS). Header-only.
+ * No networking. No graphics. Pure terminal UI + child process capture.
  */
 
 #include <stdio.h>
@@ -45,6 +46,7 @@ enum {
 #define MT_LINE_LEN       512
 #define MT_MAX_PROCS      8
 #define MT_INPUT_LEN      512
+#define MT_MAX_COMMANDS   32
 
 /* ---- Forward declarations --------------------------------------- */
 
@@ -72,7 +74,7 @@ typedef struct MTProc {
     pid_t pid;
     int   fd;
     int   used;
-    int   eof_seen;   /* NEW: track EOF so we don't re-read forever */
+    int   eof_seen;
 } MTProc;
 
 typedef struct MentalTui {
@@ -89,7 +91,7 @@ typedef struct MentalTui {
 
     MTProc   procs[MT_MAX_PROCS];
 
-    MTCommand cmds[32];
+    MTCommand cmds[MT_MAX_COMMANDS];
     int       cmd_count;
 
     int       running;
@@ -99,7 +101,7 @@ typedef struct MentalTui {
     char     *outbuf;
     size_t    outbuf_size;
 
-    int       dirty;          /* NEW: only redraw when changed */
+    int       dirty;
 } MentalTui;
 
 /* ---- Output ring ------------------------------------------------ */
@@ -137,7 +139,7 @@ static inline MTLine* mentalTuiLine(MentalTui *tui, int i)
 static inline void mentalTuiRegister(MentalTui *tui, const char *name,
                                      const char *help, MTCommandFn fn, void *user)
 {
-    if (!tui || tui->cmd_count >= (int)(sizeof(tui->cmds)/sizeof(tui->cmds[0]))) return;
+    if (!tui || tui->cmd_count >= MT_MAX_COMMANDS) return;
     MTCommand *c = &tui->cmds[tui->cmd_count++];
     c->name = name;
     c->help = help;
@@ -212,7 +214,7 @@ static inline void mentalTuiDestroy(MentalTui *tui)
     for (int i = 0; i < MT_MAX_PROCS; i++) {
         if (tui->procs[i].used) {
             kill(tui->procs[i].pid, SIGTERM);
-            close(tui->procs[i].fd);
+            if (tui->procs[i].fd >= 0) close(tui->procs[i].fd);
         }
     }
 
@@ -276,11 +278,8 @@ static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
     return slot;
 }
 
-/*
- * Drain a single proc. When read() returns 0 (EOF), close the fd
- * immediately so poll() stops reporting it readable — otherwise the
- * loop spins forever. Also reap the child.
- */
+/* ---- Drain child processes -------------------------------------- */
+
 static inline void mentalTuiDrainProcs(MentalTui *tui)
 {
     if (!tui) return;
@@ -289,7 +288,6 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
         MTProc *p = &tui->procs[i];
         if (!p->used) continue;
 
-        /* Read everything available */
         for (;;) {
             char buf[512];
             ssize_t n = read(p->fd, buf, sizeof(buf) - 1);
@@ -303,27 +301,21 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
                 }
                 continue;
             }
-
             if (n == 0) {
-                /* EOF: close fd NOW, mark done, reap child. */
                 close(p->fd);
                 p->fd = -1;
                 p->eof_seen = 1;
                 break;
             }
-
-            /* n < 0 */
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;   /* no more data */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
 
-            /* Real error: close */
             close(p->fd);
             p->fd = -1;
             p->eof_seen = 1;
             break;
         }
 
-        /* Reap child if it's done. Safe to call repeatedly. */
         if (p->eof_seen) {
             int status = 0;
             pid_t r = waitpid(p->pid, &status, WNOHANG);
@@ -334,10 +326,8 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
                 else if (WIFSIGNALED(status))
                     mentalTuiPrintf(tui, MT_BBLACK, "[signal %d]", WTERMSIG(status));
             } else if (r < 0 && errno == ECHILD) {
-                p->used = 0;   /* already reaped elsewhere */
+                p->used = 0;
             }
-            /* r == 0: child still alive after closing stdout? Possible if
-               it forked. Leave it for the next tick. */
         }
     }
 }
@@ -519,27 +509,26 @@ static inline void mentalTuiRun(MentalTui *tui)
             }
         }
 
-        /* 16 ms ~ 60 FPS. Immediate redraw on any poll hit. */
         int r = poll(fds, (nfds_t)nfds, 16);
         if (r < 0 && errno != EINTR) break;
 
         if (fds[0].revents & POLLIN) {
-            /* Drain all pending stdin without blocking */
             for (;;) {
                 unsigned char buf[64];
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if (n <= 0) break;
                 for (ssize_t i = 0; i < n; i++) mentalTuiHandleByte(tui, buf[i]);
-                if (n < (ssize_t)sizeof(buf)) break;   /* probably done */
+                if (n < (ssize_t)sizeof(buf)) break;
             }
         }
 
-        /* If any proc fd had data, we already need a redraw after drain */
         for (int i = 1; i < nfds; i++) {
-            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) { tui->dirty = 1; break; }
+            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                tui->dirty = 1;
+                break;
+            }
         }
 
-        /* Only redraw when something changed */
         if (tui->dirty) mentalTuiFlush(tui);
     }
 }
@@ -575,19 +564,19 @@ static inline void mentalTuiBuiltinQuit(MentalTui *tui, int argc, char **argv, v
 static inline void mentalTuiBuiltinExit(MentalTui *tui, int argc, char **argv, void *u)
 {
     (void)u;
-    /* Accept: exit, exit 0, exit 1 — ignore the code for now */
     if (argc >= 2) {
-        mentalTuiPrintf(tui, MT_BBLACK, "[exit %s]", argv[1]);
+        tui->exit_code = atoi(argv[1]);
+        mentalTuiPrintf(tui, MT_BBLACK, "[exit %d]", tui->exit_code);
     }
     tui->running = 0;
 }
 
 static inline void mentalTuiRegisterBuiltins(MentalTui *tui)
 {
-    mentalTuiRegister(tui, "help",  "list commands",  mentalTuiBuiltinHelp, NULL);
+    mentalTuiRegister(tui, "help",  "list commands",  mentalTuiBuiltinHelp,  NULL);
     mentalTuiRegister(tui, "clear", "clear output",   mentalTuiBuiltinClear, NULL);
-    mentalTuiRegister(tui, "quit",  "exit the TUI",   mentalTuiBuiltinQuit, NULL);
-    mentalTuiRegister(tui, "exit",  "exit [code]",    mentalTuiBuiltinExit, NULL);
+    mentalTuiRegister(tui, "quit",  "exit the TUI",   mentalTuiBuiltinQuit,  NULL);
+    mentalTuiRegister(tui, "exit",  "exit [code]",    mentalTuiBuiltinExit,  NULL);
 }
 
 #endif /* MENTAL_TUI_H */

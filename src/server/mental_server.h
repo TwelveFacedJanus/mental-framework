@@ -1,37 +1,43 @@
 #ifndef MENTAL_SERVER_H
 #define MENTAL_SERVER_H
 
+/*
+ * mental_server.h — P2P peer discovery over UDP broadcast/unicast.
+ * Requires: POSIX (FreeBSD/Linux/macOS). Header-only.
+ * No dependency on the TUI or on any graphics code.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <net/if.h>          /* IFF_LOOPBACK, IFF_BROADCAST */
 
-/* Mental P2P discovery constants */
 #define MENTAL_DISCOVERY_PORT   31337
 #define MENTAL_MAGIC            "MENTAL"
 #define MENTAL_VERSION          "1"
+#define MENTAL_MAX_PEERS        64
 
-/* A discovered peer */
+/* ---- Types ------------------------------------------------------ */
+
 typedef struct MentalPeer {
     char ip[INET_ADDRSTRLEN];
     unsigned short port;
 } MentalPeer;
 
-/* Internal state for the server */
 typedef struct MentalServer {
-    int discovery_fd;           /* UDP socket for broadcast discovery */
-    MentalPeer peers[64];       /* Simple fixed-size peer list */
+    int discovery_fd;
+    MentalPeer peers[MENTAL_MAX_PEERS];
     int peer_count;
 } MentalServer;
 
-/*
- * Create and bind the discovery socket.
- * Returns NULL on failure.
- */
+/* ---- Lifecycle -------------------------------------------------- */
+
 static inline MentalServer* mentalServerCreate(void)
 {
     MentalServer *srv = calloc(1, sizeof(MentalServer));
@@ -44,7 +50,6 @@ static inline MentalServer* mentalServerCreate(void)
         return NULL;
     }
 
-    /* Allow broadcast sending */
     int enable = 1;
     if (setsockopt(srv->discovery_fd, SOL_SOCKET, SO_BROADCAST,
                    &enable, sizeof(enable)) < 0) {
@@ -53,20 +58,12 @@ static inline MentalServer* mentalServerCreate(void)
         free(srv);
         return NULL;
     }
+    setsockopt(srv->discovery_fd, SOL_SOCKET, SO_REUSEADDR,
+               &enable, sizeof(enable));
 
-    /* Allow reuse so multiple instances can bind (useful for testing) */
-    if (setsockopt(srv->discovery_fd, SOL_SOCKET, SO_REUSEADDR,
-                   &enable, sizeof(enable)) < 0) {
-        perror("[mental/server] SO_REUSEADDR");
-        close(srv->discovery_fd);
-        free(srv);
-        return NULL;
-    }
-
-    /* Bind to receive replies on the discovery port */
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(MENTAL_DISCOVERY_PORT),
+        .sin_port   = htons(MENTAL_DISCOVERY_PORT),
         .sin_addr.s_addr = INADDR_ANY
     };
 
@@ -82,41 +79,108 @@ static inline MentalServer* mentalServerCreate(void)
     return srv;
 }
 
-/*
- * Send a broadcast ping on the local network.
- * Other running mental_server instances should reply.
- */
-static inline void mentalServerPing(MentalServer *srv)
+static inline void mentalServerDestroy(MentalServer *srv)
 {
-    if (!srv || srv->discovery_fd < 0) return;
+    if (!srv) return;
+    if (srv->discovery_fd >= 0) close(srv->discovery_fd);
+    free(srv);
+}
 
-    /* Build the announcement packet */
+/* ---- Packet builder --------------------------------------------- */
+
+static inline void mentalServerBuildPacket(char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%s|%s|PING|%d",
+             MENTAL_MAGIC, MENTAL_VERSION, (int)getpid());
+}
+
+/* ---- Broadcast PING (one packet per non-loopback interface) ----- */
+
+/*
+ * Send a PING to the directed broadcast address of every non-loopback
+ * IPv4 interface that supports broadcast. Returns the number of
+ * packets successfully sent.
+ */
+static inline int mentalServerPing(MentalServer *srv)
+{
+    if (!srv || srv->discovery_fd < 0) return 0;
+
     char packet[128];
-    snprintf(packet, sizeof(packet), "%s|%s|PING", MENTAL_MAGIC, MENTAL_VERSION);
+    mentalServerBuildPacket(packet, sizeof(packet));
 
-    struct sockaddr_in bcast = {
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("[mental/server] getifaddrs");
+        return 0;
+    }
+
+    int sent = 0;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(ifa->ifa_flags & IFF_BROADCAST)) continue;
+        if (!ifa->ifa_broadaddr) continue;
+
+        struct sockaddr_in *bcast = (struct sockaddr_in*)ifa->ifa_broadaddr;
+        struct sockaddr_in dest = {
+            .sin_family = AF_INET,
+            .sin_port   = htons(MENTAL_DISCOVERY_PORT),
+            .sin_addr   = bcast->sin_addr
+        };
+
+        ssize_t n = sendto(srv->discovery_fd, packet, strlen(packet), 0,
+                           (struct sockaddr*)&dest, sizeof(dest));
+        if (n > 0) sent++;
+    }
+    freeifaddrs(ifaddr);
+    return sent;
+}
+
+/* ---- Unicast PING to a specific peer ---------------------------- */
+
+/*
+ * Send a single PING to the given IPv4 address.
+ * Returns 0 on success, -1 on failure.
+ */
+static inline int mentalServerConnect(MentalServer *srv, const char *ip)
+{
+    if (!srv || srv->discovery_fd < 0 || !ip) return -1;
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) != 1) return -1;
+
+    char packet[128];
+    mentalServerBuildPacket(packet, sizeof(packet));
+
+    struct sockaddr_in dest = {
         .sin_family = AF_INET,
-        .sin_port = htons(MENTAL_DISCOVERY_PORT),
-        .sin_addr.s_addr = INADDR_BROADCAST
+        .sin_port   = htons(MENTAL_DISCOVERY_PORT),
+        .sin_addr   = addr
     };
 
     ssize_t n = sendto(srv->discovery_fd, packet, strlen(packet), 0,
-                       (struct sockaddr*)&bcast, sizeof(bcast));
-    if (n < 0) {
-        perror("[mental/server] broadcast send");
-    } else {
-        printf("[mental/server] Broadcast ping sent (%zd bytes)\n", n);
-    }
+                       (struct sockaddr*)&dest, sizeof(dest));
+    return n > 0 ? 0 : -1;
 }
 
+/* ---- Self-IP detection ------------------------------------------ */
+
+/*
+ * Returns 1 if `ip` is one of this machine's IPv4 addresses.
+ * Used to filter out our own broadcast packet.
+ */
 static inline int mentalServerIsSelfIp(const char *ip)
 {
+    if (!ip) return 0;
     struct ifaddrs *ifaddr, *ifa;
     if (getifaddrs(&ifaddr) == -1) return 0;
 
     int found = 0;
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+
         struct sockaddr_in *sin = (struct sockaddr_in*)ifa->ifa_addr;
         char buf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
@@ -126,10 +190,11 @@ static inline int mentalServerIsSelfIp(const char *ip)
     return found;
 }
 
+/* ---- Receive / register peers ----------------------------------- */
+
 /*
- * Listen for incoming broadcasts / replies.
- * Call this periodically (e.g., every frame or on a timer thread).
- * Returns the number of new peers discovered this call.
+ * Non-blocking: try to receive one packet. Returns 1 if a new peer
+ * was registered, 0 otherwise. Call this repeatedly from the main loop.
  */
 static inline int mentalServerPoll(MentalServer *srv)
 {
@@ -139,63 +204,36 @@ static inline int mentalServerPoll(MentalServer *srv)
     struct sockaddr_in sender;
     socklen_t sender_len = sizeof(sender);
 
-    /* Non-blocking peek: use MSG_DONTWAIT to avoid blocking */
     ssize_t n = recvfrom(srv->discovery_fd, buf, sizeof(buf) - 1,
-                         MSG_DONTWAIT, (struct sockaddr*)&sender, &sender_len);
+                         MSG_DONTWAIT,
+                         (struct sockaddr*)&sender, &sender_len);
     if (n <= 0) return 0;
 
     buf[n] = '\0';
 
-    /* Validate magic */
-    if (strncmp(buf, MENTAL_MAGIC, strlen(MENTAL_MAGIC)) != 0) {
+    if (strncmp(buf, MENTAL_MAGIC, strlen(MENTAL_MAGIC)) != 0)
         return 0;
-    }
 
-    char *ip_str = inet_ntoa(sender.sin_addr);
-    if (mentalServerIsSelfIp(ip_str)) {
-        return 0;   /* It's us — ignore */
-    }
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &sender.sin_addr, ip_str, sizeof(ip_str));
     unsigned short port = ntohs(sender.sin_port);
 
-    /* Check if we already know this peer */
-    for (int i = 0; i < srv->peer_count; i++) {
-        if (strcmp(srv->peers[i].ip, ip_str) == 0) {
-            return 0; /* Already known */
-        }
-    }
+    /* Ignore our own broadcast */
+    if (mentalServerIsSelfIp(ip_str)) return 0;
 
-    /* Add new peer */
-    if (srv->peer_count < (int)(sizeof(srv->peers) / sizeof(srv->peers[0]))) {
-        MentalPeer *p = &srv->peers[srv->peer_count++];
-        strncpy(p->ip, ip_str, sizeof(p->ip) - 1);
-        p->port = port;
-        printf("[mental/server] Discovered peer: %s:%u\n", p->ip, p->port);
-        return 1;
-    }
+    /* Deduplicate by IP */
+    for (int i = 0; i < srv->peer_count; i++)
+        if (strcmp(srv->peers[i].ip, ip_str) == 0) return 0;
 
-    return 0;
-}
+    if (srv->peer_count >= MENTAL_MAX_PEERS) return 0;
 
-/*
- * Print all currently known peers.
- */
-static inline void mentalServerPrintPeers(MentalServer *srv)
-{
-    if (!srv) return;
-    printf("[mental/server] Known peers: %d\n", srv->peer_count);
-    for (int i = 0; i < srv->peer_count; i++) {
-        printf("  - %s:%u\n", srv->peers[i].ip, srv->peers[i].port);
-    }
-}
+    MentalPeer *p = &srv->peers[srv->peer_count++];
+    strncpy(p->ip, ip_str, sizeof(p->ip) - 1);
+    p->ip[sizeof(p->ip) - 1] = '\0';
+    p->port = port;
 
-/*
- * Clean up.
- */
-static inline void mentalServerDestroy(MentalServer *srv)
-{
-    if (!srv) return;
-    if (srv->discovery_fd >= 0) close(srv->discovery_fd);
-    free(srv);
+    printf("[mental/server] Discovered peer: %s:%u\n", p->ip, p->port);
+    return 1;
 }
 
 #endif /* MENTAL_SERVER_H */
