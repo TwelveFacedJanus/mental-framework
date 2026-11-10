@@ -1,16 +1,53 @@
-#ifndef MENTAL_TUI_H
-#define MENTAL_TUI_H
+#ifndef MENTAL_FRAMEWORK_H
+#define MENTAL_FRAMEWORK_H
 
-/*
- * mental_tui.h — command-driven ANSI TUI with shell & process integration.
- * Requires: POSIX (FreeBSD/Linux/macOS). Header-only.
- * No networking. No graphics. Pure terminal UI + child process capture.
- */
+/* ============================================================
+ *  Version / build configuration
+ * ============================================================ */
+#define ENABLE_OPENGL_BACKEND
+#define ENABLE_VULKAN_BACKEND
 
-#include <stdio.h>
+#if defined(ENABLE_OPENGL_BACKEND)
+  static const int OPENGL_VERSION[2] = { 3, 3 };
+#elif defined(ENABLE_VULKAN_BACKEND)
+  static const int VULKAN_API_VERSION[2] = { 1, 3 };
+#endif
+
+#define MENTAL_FRAMEWORK_MAJOR_VERSION 1
+#define MENTAL_FRAMEWORK_MINOR_VERSION 0
+
+/* ============================================================
+ *  Tunables
+ * ============================================================ */
+#define MAX_TUI_COMMAND_LENGTH   256
+#define MAX_TUI_USERNAME_LENGTH   52
+#define MAX_TUI_PASSWORD_LENGTH   52
+
+#define MT_OUTPUT_LINES   256
+#define MT_LINE_LEN       512
+#define MT_MAX_PROCS        8
+#define MT_INPUT_LEN      512
+#define MT_MAX_COMMANDS    32
+
+/* ============================================================
+ *  ANSI escapes  (single source of truth)
+ * ============================================================ */
+#define MT_ESC         "\x1b["
+#define MT_RESET       "\x1b[0m"
+#define MT_HIDE_CURSOR "\x1b[?25l"
+#define MT_SHOW_CURSOR "\x1b[?25h"
+#define MT_CLEAR       "\x1b[2J"
+#define MT_HOME        "\x1b[H"
+
+/* ============================================================
+ *  Standard headers
+ * ============================================================ */
 #include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
-#include <stdarg.h>
+#include <stdio.h>
+#include <stdarg.h>      /* must precede any va_list use */
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -21,52 +58,51 @@
 #include <sys/wait.h>
 #include <poll.h>
 
-/* ---- ANSI ------------------------------------------------------- */
+/* ============================================================
+ *  Core enums / result codes
+ * ============================================================ */
+typedef enum MentalInterfaceType {
+    MENTAL_INTERFACE_TUI = 0,
+} MentalInterfaceType;
 
-#define MT_ESC            "\x1b["
-#define MT_RESET          "\x1b[0m"
-#define MT_HIDE_CURSOR    "\x1b[?25l"
-#define MT_SHOW_CURSOR    "\x1b[?25h"
-#define MT_CLEAR          "\x1b[2J"
-#define MT_HOME           "\x1b[H"
+typedef enum MentalResult {
+    MENTAL_RESULT_TYPE_NO_INFO_POINTER = -2,
+    MENTAL_RESULT_TYPE_POINTER_IS_NULL = -1,
+    MENTAL_RESULT_TYPE_OK              =  0,
+} MentalResult;
 
-enum {
-    MT_BLACK=30, MT_RED, MT_GREEN, MT_YELLOW, MT_BLUE, MT_MAGENTA, MT_CYAN, MT_WHITE,
-    MT_FG_DEFAULT=39,
-    MT_BBLACK=90, MT_BRED, MT_BGREEN, MT_BYELLOW, MT_BBLUE, MT_BMAGENTA, MT_BCYAN, MT_BWHITE
-};
+typedef enum MentalTuiCode {
+    MENTAL_TUI_CODE_QUIT    = 0,
+    MENTAL_TUI_CODE_UNKNOWN = 1,
+    MENTAL_TUI_CODE_HELP    = 2,
+    MENTAL_TUI_CODE_SHOW_INFO = 3,
+} MentalTuiCode;
 
-enum {
-    MT_BG_DEFAULT=49, MT_BG_BLACK=40
-};
+/* ============================================================
+ *  ANSI colour palette  (single enum, matches both files)
+ * ============================================================ */
+typedef enum MentalMTColors {
+    MT_BLACK = 30, MT_RED, MT_GREEN, MT_YELLOW, MT_BLUE, MT_MAGENTA, MT_CYAN, MT_WHITE,
+    MT_FG_DEFAULT = 39,
+    MT_BBLACK = 90, MT_BRED, MT_BGREEN, MT_BYELLOW, MT_BBLUE, MT_BMAGENTA, MT_BCYAN, MT_BWHITE,
+    MT_BG_DEFAULT = 49, MT_BG_BLACK = 40
+} MentalMTColors;
 
-/* ---- Tunables --------------------------------------------------- */
-
-#define MT_OUTPUT_LINES   256
-#define MT_LINE_LEN       512
-#define MT_MAX_PROCS      8
-#define MT_INPUT_LEN      512
-#define MT_MAX_COMMANDS   32
-
-/* ---- Forward declarations --------------------------------------- */
-
+/* ============================================================
+ *  TUI data types
+ * ============================================================ */
 struct MentalTui;
-
-/* ---- Command callback & registry -------------------------------- */
-
 typedef void (*MTCommandFn)(struct MentalTui *tui, int argc, char **argv, void *user);
 
 typedef struct MTCommand {
     const char *name;
     const char *help;
     MTCommandFn fn;
-    void *user;
+    void       *user;
 } MTCommand;
 
-/* ---- Internal types --------------------------------------------- */
-
 typedef struct MTLine {
-    char text[MT_LINE_LEN];
+    char          text[MT_LINE_LEN];
     unsigned char fg;
 } MTLine;
 
@@ -81,30 +117,32 @@ typedef struct MentalTui {
     int width, height;
     int exit_code;
 
-    MTLine  *lines;
-    int      line_head;
-    int      line_count;
+    MTLine *lines;
+    int     line_head;
+    int     line_count;
 
-    char     input[MT_INPUT_LEN];
-    int      input_len;
-    int      input_cursor;
+    char input[MT_INPUT_LEN];
+    int  input_len;
+    int  input_cursor;
 
-    MTProc   procs[MT_MAX_PROCS];
+    MTProc procs[MT_MAX_PROCS];
 
     MTCommand cmds[MT_MAX_COMMANDS];
     int       cmd_count;
 
-    int       running;
-    int       raw_mode_saved;
+    int running;
+    int raw_mode_saved;
     struct termios orig_termios;
 
-    char     *outbuf;
-    size_t    outbuf_size;
+    char  *outbuf;
+    size_t outbuf_size;
 
-    int       dirty;
+    int dirty;
 } MentalTui;
 
-/* ---- Output ring ------------------------------------------------ */
+/* ============================================================
+ *  TUI implementation  (header-only, static inline)
+ * ============================================================ */
 
 static inline void mentalTuiPrintf(MentalTui *tui, int fg, const char *fmt, ...)
 {
@@ -116,7 +154,7 @@ static inline void mentalTuiPrintf(MentalTui *tui, int fg, const char *fmt, ...)
     va_end(ap);
 
     size_t n = strlen(buf);
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
 
     MTLine *slot = &tui->lines[tui->line_head];
     strncpy(slot->text, buf, MT_LINE_LEN - 1);
@@ -128,13 +166,11 @@ static inline void mentalTuiPrintf(MentalTui *tui, int fg, const char *fmt, ...)
     tui->dirty = 1;
 }
 
-static inline MTLine* mentalTuiLine(MentalTui *tui, int i)
+static inline MTLine *mentalTuiLine(MentalTui *tui, int i)
 {
     int start = (tui->line_head - tui->line_count + MT_OUTPUT_LINES) % MT_OUTPUT_LINES;
     return &tui->lines[(start + i) % MT_OUTPUT_LINES];
 }
-
-/* ---- Command registry ------------------------------------------- */
 
 static inline void mentalTuiRegister(MentalTui *tui, const char *name,
                                      const char *help, MTCommandFn fn, void *user)
@@ -146,8 +182,6 @@ static inline void mentalTuiRegister(MentalTui *tui, const char *name,
     c->fn   = fn;
     c->user = user;
 }
-
-/* ---- Terminal setup --------------------------------------------- */
 
 static inline void mentalTuiTerminalSize(int *w, int *h)
 {
@@ -178,14 +212,12 @@ static inline void mentalTuiLeaveRaw(MentalTui *tui)
     }
 }
 
-/* ---- Lifecycle --------------------------------------------------- */
-
-static inline MentalTui* mentalTuiCreate(int width, int height)
+static inline MentalTui *mentalTuiCreate(int width, int height)
 {
     if (width <= 0 || height <= 0)
         mentalTuiTerminalSize(&width, &height);
 
-    MentalTui *tui = calloc(1, sizeof(MentalTui));
+    MentalTui *tui = calloc(1, sizeof(*tui));
     if (!tui) return NULL;
 
     tui->width  = width;
@@ -227,16 +259,13 @@ static inline void mentalTuiDestroy(MentalTui *tui)
     free(tui);
 }
 
-/* ---- Background process spawning -------------------------------- */
-
 static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
 {
     if (!tui || !cmd) return -1;
 
     int slot = -1;
-    for (int i = 0; i < MT_MAX_PROCS; i++) {
+    for (int i = 0; i < MT_MAX_PROCS; i++)
         if (!tui->procs[i].used) { slot = i; break; }
-    }
     if (slot < 0) {
         mentalTuiPrintf(tui, MT_BRED, "[tui] too many running processes");
         return -1;
@@ -262,7 +291,7 @@ static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
         close(pipefd[1]);
         if (tui->raw_mode_saved)
             tcsetattr(STDIN_FILENO, TCSANOW, &tui->orig_termios);
-        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
 
@@ -277,8 +306,6 @@ static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
     mentalTuiPrintf(tui, MT_BBLACK, "$ %s", cmd);
     return slot;
 }
-
-/* ---- Drain child processes -------------------------------------- */
 
 static inline void mentalTuiDrainProcs(MentalTui *tui)
 {
@@ -301,12 +328,7 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
                 }
                 continue;
             }
-            if (n == 0) {
-                close(p->fd);
-                p->fd = -1;
-                p->eof_seen = 1;
-                break;
-            }
+            if (n == 0) { close(p->fd); p->fd = -1; p->eof_seen = 1; break; }
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
 
@@ -332,13 +354,11 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
     }
 }
 
-/* ---- Frame rendering -------------------------------------------- */
-
 static inline void mentalTuiFlush(MentalTui *tui)
 {
     if (!tui) return;
 
-    char *p = tui->outbuf;
+    char  *p   = tui->outbuf;
     size_t rem = tui->outbuf_size;
 
     int output_rows = tui->height - 1;
@@ -406,8 +426,6 @@ static inline void mentalTuiFlush(MentalTui *tui)
     tui->dirty = 0;
 }
 
-/* ---- Input handling --------------------------------------------- */
-
 static inline void mentalTuiSubmitInput(MentalTui *tui);
 
 static inline void mentalTuiHandleByte(MentalTui *tui, unsigned char c)
@@ -439,8 +457,6 @@ static inline void mentalTuiHandleByte(MentalTui *tui, unsigned char c)
         }
     }
 }
-
-/* ---- Command execution ------------------------------------------ */
 
 static inline void mentalTuiSubmitInput(MentalTui *tui)
 {
@@ -480,13 +496,11 @@ static inline void mentalTuiSubmitInput(MentalTui *tui)
         if (!handled) mentalTuiSpawnShell(tui, tui->input);
     }
 
-    tui->input_len = 0;
+    tui->input_len    = 0;
     tui->input_cursor = 0;
-    tui->input[0] = '\0';
-    tui->dirty = 1;
+    tui->input[0]     = '\0';
+    tui->dirty        = 1;
 }
-
-/* ---- Main loop --------------------------------------------------- */
 
 static inline void mentalTuiRun(MentalTui *tui)
 {
@@ -497,13 +511,13 @@ static inline void mentalTuiRun(MentalTui *tui)
         mentalTuiDrainProcs(tui);
 
         int nfds = 1;
-        fds[0].fd = STDIN_FILENO;
+        fds[0].fd     = STDIN_FILENO;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
         for (int i = 0; i < MT_MAX_PROCS; i++) {
             if (tui->procs[i].used && tui->procs[i].fd >= 0) {
-                fds[nfds].fd = tui->procs[i].fd;
-                fds[nfds].events = POLLIN;
+                fds[nfds].fd      = tui->procs[i].fd;
+                fds[nfds].events  = POLLIN;
                 fds[nfds].revents = 0;
                 nfds++;
             }
@@ -533,17 +547,21 @@ static inline void mentalTuiRun(MentalTui *tui)
     }
 }
 
-/* ---- Built-in commands ------------------------------------------ */
+/* ---- Built-ins ------------------------------------------------- */
+static inline void mentalTuiBuiltinShowInfo(MentalTui *tui, int argc, char **argv, void *u)
+{
+  (void)argc; (void)argv; (void)u;
+  mentalTuiPrintf(tui, MT_WHITE, "MENTAL INSTANCE INFO\n");
+}
 
 static inline void mentalTuiBuiltinHelp(MentalTui *tui, int argc, char **argv, void *u)
 {
     (void)argc; (void)argv; (void)u;
     mentalTuiPrintf(tui, MT_BYELLOW, "Commands:");
-    for (int i = 0; i < tui->cmd_count; i++) {
+    for (int i = 0; i < tui->cmd_count; i++)
         mentalTuiPrintf(tui, MT_WHITE, "  %-12s %s",
                         tui->cmds[i].name,
                         tui->cmds[i].help ? tui->cmds[i].help : "");
-    }
     mentalTuiPrintf(tui, MT_BBLACK, "  (anything else runs via /bin/sh -c)");
 }
 
@@ -551,8 +569,8 @@ static inline void mentalTuiBuiltinClear(MentalTui *tui, int argc, char **argv, 
 {
     (void)argc; (void)argv; (void)u;
     tui->line_count = 0;
-    tui->line_head = 0;
-    tui->dirty = 1;
+    tui->line_head  = 0;
+    tui->dirty      = 1;
 }
 
 static inline void mentalTuiBuiltinQuit(MentalTui *tui, int argc, char **argv, void *u)
@@ -571,12 +589,112 @@ static inline void mentalTuiBuiltinExit(MentalTui *tui, int argc, char **argv, v
     tui->running = 0;
 }
 
+
 static inline void mentalTuiRegisterBuiltins(MentalTui *tui)
 {
-    mentalTuiRegister(tui, "help",  "list commands",  mentalTuiBuiltinHelp,  NULL);
-    mentalTuiRegister(tui, "clear", "clear output",   mentalTuiBuiltinClear, NULL);
-    mentalTuiRegister(tui, "quit",  "exit the TUI",   mentalTuiBuiltinQuit,  NULL);
-    mentalTuiRegister(tui, "exit",  "exit [code]",    mentalTuiBuiltinExit,  NULL);
+    mentalTuiRegister(tui, "show-info", "Show mental instance info", mentalTuiBuiltinShowInfo, NULL);
+    mentalTuiRegister(tui, "help",  "list commands", mentalTuiBuiltinHelp,  NULL);
+    mentalTuiRegister(tui, "clear", "clear output",  mentalTuiBuiltinClear, NULL);
+    mentalTuiRegister(tui, "quit",  "exit the TUI",  mentalTuiBuiltinQuit,  NULL);
+    mentalTuiRegister(tui, "exit",  "exit [code]",   mentalTuiBuiltinExit,  NULL);
 }
 
-#endif /* MENTAL_TUI_H */
+/* ============================================================
+ *  Instance / lifecycle
+ * ============================================================ */
+typedef struct MentalInstanceInfo {
+    const char             *pApplicationName;
+    enum MentalInterfaceType eInterfaceType;
+} MentalInstanceInfo;
+
+typedef struct MentalInstance {
+    MentalInstanceInfo *pInfo;
+    MentalTui          *pTui;   /* populated when eInterfaceType == TUI */
+} MentalInstance;
+
+static inline enum MentalResult mental_instance_create(MentalInstance *pInstance)
+{
+    if (!pInstance)          return MENTAL_RESULT_TYPE_POINTER_IS_NULL;
+    if (!pInstance->pInfo)   return MENTAL_RESULT_TYPE_NO_INFO_POINTER;
+
+    if (pInstance->pInfo->eInterfaceType == MENTAL_INTERFACE_TUI) {
+        MentalTui *tui = mentalTuiCreate(0, 0);
+        if (!tui) return MENTAL_RESULT_TYPE_POINTER_IS_NULL;
+        mentalTuiRegisterBuiltins(tui);
+        pInstance->pTui = tui;
+        mentalTuiRun(tui);
+    }
+    return MENTAL_RESULT_TYPE_OK;
+}
+
+void mental_instance_destroy(MentalInstance *pInstance);
+
+/* ============================================================
+ *  Function queue
+ * ============================================================ */
+typedef enum FunctionQueueType FunctionQueueType;
+typedef struct FunctionInfo FunctionInfo;
+typedef struct FunctionQueue FunctionQueue;
+
+FunctionQueue *mental_fqueue_initialize(void);
+void           mental_fqueue_destroy(FunctionQueue *pQueue);
+void           mental_fqueue_remove_function_by_id(const char *uuid);
+FunctionInfo  *mental_fqueue_getf_by_id(const char *uuid);
+void           mental_fqueue_add_f(FunctionInfo *pInfo);
+
+/* ============================================================
+ *  System / network info
+ * ============================================================ */
+int  __mental_sysctl_int(const char *pName, int *pOut);
+int  __mental_sysctl_str(const char *pName, char *pBuf, size_t buflen);
+void mental_print_network_info(void);
+void mental_print_system_info(void);
+
+/* ============================================================
+ *  Logging
+ * ============================================================ */
+typedef struct MentalLogger MentalLogger;
+int  mental_logger_initialize(const char *pLogFilePath);
+void mental_logger_destroy(void);
+void mental_logger_flush(void);
+
+int __mental_logger_write_impl(const char *pFunc, const char *pFmt, va_list args);
+int __mental_logger_write(const char *pFunc, const char *pFmt, ...);
+int __mental_logger_write_fl(const char *pFile, int line,
+                             const char *pFunc, const char *pFmt, ...);
+
+#define log(...)  __mental_logger_write(__func__, __VA_ARGS__)
+#define logf(...) __mental_logger_write_fl(__FILE__, __LINE__, __func__, __VA_ARGS__)
+
+/* ============================================================
+ *  Window manager / GL
+ * ============================================================ */
+typedef struct MentalWindowManager MentalWindowManager;
+MentalWindowManager *mental_wm_initialize(void);
+void mental_wm_destroy(void);
+int  mental_window_should_close(MentalWindowManager *pWm);
+
+int  mental_glew_initialize(MentalWindowManager *pWm);
+int  mental_has_gle_extension(const char *pName);
+void mental_print_gl_info(void);
+void mental_set_clear_color_rgb(unsigned char r, unsigned int g,
+                                unsigned char b, unsigned char a);
+void mental_enable_core_defaults(void);
+
+/* ============================================================
+ *  P2P
+ * ============================================================ */
+#define P2P_DEFAULT_PORT 31337
+#define P2P_MAX_PEERS    64
+
+typedef struct MentalP2PPackage MentalP2PPackage;
+typedef struct MentalP2PPeer    MentalP2PPeer;
+typedef struct MentalP2PServer  MentalP2PServer;
+
+MentalP2PServer *mental_p2p_initialize(void);
+void mental_p2p_destroy(void);
+void mental_p2p_connect(void);
+void mental_p2p_ping(void);
+void mental_p2p_poll(void);
+
+#endif /* MENTAL_FRAMEWORK_H */

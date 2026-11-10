@@ -5,12 +5,52 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include "common/openrouter.h"
 #include "graphics/mental_tui.h"
 #include "server/mental_server.h"
 
 /* ---- P2P state -------------------------------------------------- */
 
 static MentalServer *g_server = NULL;
+
+/* ---- AI --------------------------------------------------------- */
+static MentalAIChat *g_ai_chat = NULL;
+
+static void cmd_ai(MentalTui *tui, int argc, char **argv, void *user) {
+    (void)user;
+    if (argc < 2) {
+        mentalTuiPrintf(tui, MT_YELLOW, "usage: ai <message>");
+        return;
+    }
+
+    if (!g_ai_chat) {
+        const char *key = getenv("ODI_ROUTER_API_KEY");
+        if (!key) {
+            mentalTuiPrintf(tui, MT_BRED, "[ai] ODI_ROUTER_API_KEY not set");
+            return;
+        }
+        g_ai_chat = mentalAIChatCreate(key,
+            "You are a helpful assistant inside a terminal TUI.");
+    }
+
+    char prompt[512] = {0};
+    for (int i = 1; i < argc; i++) {
+        strncat(prompt, argv[i], sizeof(prompt) - strlen(prompt) - 1);
+        if (i < argc - 1) strncat(prompt, " ", sizeof(prompt) - strlen(prompt) - 1);
+    }
+
+    mentalTuiPrintf(tui, MT_BBLACK, "[ai] thinking...");
+
+    char *reply = mentalAIChatSend(g_ai_chat, prompt);
+    if (reply) {
+        mentalTuiPrintf(tui, MT_BCYAN, "AI: %s", reply);
+        free(reply);
+    } else {
+        mentalTuiPrintf(tui, MT_BRED, "[ai] request failed");
+        if (g_ai_chat->last_error[0])
+            mentalTuiPrintf(tui, MT_BRED, "[ai] raw: %.500s", g_ai_chat->last_error);
+    }
+}
 
 /* ---- Commands --------------------------------------------------- */
 
@@ -132,11 +172,13 @@ int main(void)
     mentalTuiRegister(tui, "logs",      "logs [path] - tail file",    cmd_logs,      NULL);
     mentalTuiRegister(tui, "shell",     "shell <cmd> - run command",  cmd_shell,     NULL);
     mentalTuiRegister(tui, "sysinfo",   "print system info",          cmd_sysinfo,   NULL);
+    mentalTuiRegister(tui, "ai", "ai <message> - ask AI", cmd_ai, NULL);
 
     mentalTuiRun(tui);
     int code = tui->exit_code;
     mentalTuiDestroy(tui);
 
     if (g_server) mentalServerDestroy(g_server);
+    if (g_ai_chat) mentalAIChatDestroy(g_ai_chat);  
     return code;
 }
