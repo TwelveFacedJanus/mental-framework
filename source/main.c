@@ -1,15 +1,16 @@
 #include "mentalsdklib.h"
 
-
-
-int main(void) {
+int main(void)
+{
     MentalInstanceInfo info = {
         .pApplicationName = "mental",
         .eInterfaceType   = MENTAL_INTERFACE_TUI,
     };
-    MentalInstance inst = { .pInfo = &info, .pTui = NULL };
+    MentalInstance inst = { .pInfo = &info, .pTui = NULL, .pP2P = NULL };
 
-    mental_instance_create(&inst);
-    if (inst.pTui) mentalTuiDestroy(inst.pTui);
+    if (mental_instance_create(&inst) != MENTAL_RESULT_TYPE_OK)
+        return 1;
+
+    mental_instance_destroy(&inst);
     return 0;
 }

@@ -29,8 +29,14 @@
 #define MT_INPUT_LEN      512
 #define MT_MAX_COMMANDS    32
 
+/* P2P tunables */
+#define P2P_DEFAULT_PORT 31337
+#define P2P_MAX_PEERS    64
+#define P2P_MAGIC        "MENTAL"
+#define P2P_VERSION      "1"
+
 /* ============================================================
- *  ANSI escapes  (single source of truth)
+ *  ANSI escapes
  * ============================================================ */
 #define MT_ESC         "\x1b["
 #define MT_RESET       "\x1b[0m"
@@ -47,7 +53,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdarg.h>      /* must precede any va_list use */
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -56,7 +62,15 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/utsname.h>
+#include <sys/sysctl.h>
 #include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 /* ============================================================
  *  Core enums / result codes
@@ -72,14 +86,14 @@ typedef enum MentalResult {
 } MentalResult;
 
 typedef enum MentalTuiCode {
-    MENTAL_TUI_CODE_QUIT    = 0,
-    MENTAL_TUI_CODE_UNKNOWN = 1,
-    MENTAL_TUI_CODE_HELP    = 2,
+    MENTAL_TUI_CODE_QUIT      = 0,
+    MENTAL_TUI_CODE_UNKNOWN   = 1,
+    MENTAL_TUI_CODE_HELP      = 2,
     MENTAL_TUI_CODE_SHOW_INFO = 3,
 } MentalTuiCode;
 
 /* ============================================================
- *  ANSI colour palette  (single enum, matches both files)
+ *  ANSI colour palette
  * ============================================================ */
 typedef enum MentalMTColors {
     MT_BLACK = 30, MT_RED, MT_GREEN, MT_YELLOW, MT_BLUE, MT_MAGENTA, MT_CYAN, MT_WHITE,
@@ -87,6 +101,40 @@ typedef enum MentalMTColors {
     MT_BBLACK = 90, MT_BRED, MT_BGREEN, MT_BYELLOW, MT_BBLUE, MT_BMAGENTA, MT_BCYAN, MT_BWHITE,
     MT_BG_DEFAULT = 49, MT_BG_BLACK = 40
 } MentalMTColors;
+
+/* ============================================================
+ *  Line sink  (decouples output producers from stdout/TUI)
+ * ============================================================ */
+struct MentalSink;
+typedef void (*MentalSinkLineFn)(struct MentalSink *self, int color, const char *text);
+
+typedef struct MentalSink {
+    MentalSinkLineFn line;
+    void            *ctx;
+} MentalSink;
+
+static inline void mental_sink_printf(MentalSink *s, int color, const char *fmt, ...)
+{
+    if (!s || !s->line) return;
+    char buf[MT_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    s->line(s, color, buf);
+}
+
+/* ---- stdout sink ------------------------------------------------ */
+static inline void mental_sink_stdout_line(MentalSink *self, int color, const char *text)
+{
+    (void)self; (void)color;
+    puts(text);
+}
+static inline MentalSink mental_sink_stdout(void)
+{
+    MentalSink s = { mental_sink_stdout_line, NULL };
+    return s;
+}
 
 /* ============================================================
  *  TUI data types
@@ -113,6 +161,24 @@ typedef struct MTProc {
     int   eof_seen;
 } MTProc;
 
+/* ---- P2P types (must precede MentalTui) ------------------------- */
+typedef struct MentalP2PPeer {
+    char           ip[INET_ADDRSTRLEN];
+    unsigned short port;
+} MentalP2PPeer;
+
+typedef struct MentalP2PServer {
+    int            discovery_fd;
+    MentalP2PPeer  peers[P2P_MAX_PEERS];
+    int            peer_count;
+    MentalSink    *log_sink;
+    int            initialized;
+} MentalP2PServer;
+
+/* Notify callback: TUI invokes it whenever P2P is created/destroyed,
+ * letting external owners (e.g. MentalInstance) mirror the pointer. */
+typedef void (*MentalP2PNotifyFn)(void *ctx, MentalP2PServer *srv);
+
 typedef struct MentalTui {
     int width, height;
     int exit_code;
@@ -137,11 +203,17 @@ typedef struct MentalTui {
     char  *outbuf;
     size_t outbuf_size;
 
+    MentalP2PServer    *p2p;
+    MentalSink          p2p_sink;
+    int                 p2p_sink_ready;
+    MentalP2PNotifyFn   p2p_notify;
+    void               *p2p_notify_ctx;
+
     int dirty;
 } MentalTui;
 
 /* ============================================================
- *  TUI implementation  (header-only, static inline)
+ *  TUI core
  * ============================================================ */
 
 static inline void mentalTuiPrintf(MentalTui *tui, int fg, const char *fmt, ...)
@@ -164,6 +236,31 @@ static inline void mentalTuiPrintf(MentalTui *tui, int fg, const char *fmt, ...)
     tui->line_head = (tui->line_head + 1) % MT_OUTPUT_LINES;
     if (tui->line_count < MT_OUTPUT_LINES) tui->line_count++;
     tui->dirty = 1;
+}
+
+static inline void mentalTuiPrintfWrap(MentalTui *tui, int fg, const char *text)
+{
+    if (!tui) return;
+    int max = tui->width - 2;
+    if (max < 20) max = 20;
+    size_t len = strlen(text);
+    if (len == 0) { mentalTuiPrintf(tui, fg, ""); return; }
+    for (size_t i = 0; i < len; i += (size_t)max) {
+        size_t n = (len - i < (size_t)max) ? (len - i) : (size_t)max;
+        mentalTuiPrintf(tui, fg, "%.*s", (int)n, text + i);
+    }
+}
+
+/* ---- TUI sink -------------------------------------------------- */
+static inline void mental_sink_tui_line(MentalSink *self, int color, const char *text)
+{
+    MentalTui *tui = (MentalTui *)self->ctx;
+    mentalTuiPrintfWrap(tui, color, text);
+}
+static inline MentalSink mental_sink_tui(MentalTui *tui)
+{
+    MentalSink s = { mental_sink_tui_line, tui };
+    return s;
 }
 
 static inline MTLine *mentalTuiLine(MentalTui *tui, int i)
@@ -259,6 +356,237 @@ static inline void mentalTuiDestroy(MentalTui *tui)
     free(tui);
 }
 
+/* ============================================================
+ *  P2P server
+ * ============================================================ */
+
+static inline void mentalP2PLog(MentalP2PServer *srv, int color,
+                                const char *fmt, ...)
+{
+    if (!srv || !srv->log_sink) return;
+    char buf[MT_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    mental_sink_printf(srv->log_sink, color, "%s", buf);
+}
+
+static inline void mentalP2PSetLogSink(MentalP2PServer *srv, MentalSink *sink)
+{
+    if (srv) srv->log_sink = sink;
+}
+
+static inline MentalP2PServer *mentalP2PCreate(void)
+{
+    MentalP2PServer *srv = calloc(1, sizeof(*srv));
+    if (!srv) return NULL;
+
+    srv->discovery_fd = -1;
+
+    srv->discovery_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (srv->discovery_fd < 0) {
+        mentalP2PLog(srv, MT_BRED, "[p2p] socket: %s", strerror(errno));
+        free(srv);
+        return NULL;
+    }
+
+    int enable = 1;
+    if (setsockopt(srv->discovery_fd, SOL_SOCKET, SO_BROADCAST,
+                   &enable, sizeof(enable)) < 0) {
+        mentalP2PLog(srv, MT_BRED, "[p2p] SO_BROADCAST: %s", strerror(errno));
+        close(srv->discovery_fd);
+        free(srv);
+        return NULL;
+    }
+    setsockopt(srv->discovery_fd, SOL_SOCKET, SO_REUSEADDR,
+               &enable, sizeof(enable));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(P2P_DEFAULT_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(srv->discovery_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        mentalP2PLog(srv, MT_BRED, "[p2p] bind: %s", strerror(errno));
+        close(srv->discovery_fd);
+        free(srv);
+        return NULL;
+    }
+
+    int flags = fcntl(srv->discovery_fd, F_GETFL, 0);
+    fcntl(srv->discovery_fd, F_SETFL, flags | O_NONBLOCK);
+
+    srv->initialized = 1;
+    mentalP2PLog(srv, MT_BGREEN,
+                 "[p2p] discovery listening on UDP port %d",
+                 P2P_DEFAULT_PORT);
+    return srv;
+}
+
+static inline void mentalP2PDestroy(MentalP2PServer *srv)
+{
+    if (!srv) return;
+    if (srv->discovery_fd >= 0) close(srv->discovery_fd);
+    free(srv);
+}
+
+static inline void mentalP2PBuildPacket(char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%s|%s|PING|%d",
+             P2P_MAGIC, P2P_VERSION, (int)getpid());
+}
+
+static inline int mentalP2PIsSelfIp(const char *ip)
+{
+    if (!ip) return 0;
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) return 0;
+
+    int found = 0;
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+
+        struct sockaddr_in *sin = (struct sockaddr_in*)ifa->ifa_addr;
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+        if (strcmp(buf, ip) == 0) { found = 1; break; }
+    }
+    freeifaddrs(ifaddr);
+    return found;
+}
+
+static inline int mentalP2PPing(MentalP2PServer *srv)
+{
+    if (!srv || srv->discovery_fd < 0) return 0;
+
+    char packet[128];
+    mentalP2PBuildPacket(packet, sizeof(packet));
+
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) {
+        mentalP2PLog(srv, MT_BRED, "[p2p] getifaddrs: %s", strerror(errno));
+        return 0;
+    }
+
+    int sent = 0;
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(ifa->ifa_flags & IFF_BROADCAST)) continue;
+        if (!ifa->ifa_broadaddr) continue;
+
+        struct sockaddr_in *bcast = (struct sockaddr_in*)ifa->ifa_broadaddr;
+        struct sockaddr_in dest;
+        memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        dest.sin_port   = htons(P2P_DEFAULT_PORT);
+        dest.sin_addr   = bcast->sin_addr;
+
+        ssize_t n = sendto(srv->discovery_fd, packet, strlen(packet), 0,
+                           (struct sockaddr*)&dest, sizeof(dest));
+        if (n > 0) {
+            sent++;
+            mentalP2PLog(srv, MT_BBLACK, "[p2p] -> %s:%d (%s)",
+                         inet_ntoa(dest.sin_addr), P2P_DEFAULT_PORT,
+                         ifa->ifa_name);
+        }
+    }
+    freeifaddrs(ifaddr);
+
+    if (sent == 0)
+        mentalP2PLog(srv, MT_BYELLOW, "[p2p] no broadcast interfaces found");
+    else
+        mentalP2PLog(srv, MT_BGREEN, "[p2p] sent %d PING packet(s)", sent);
+    return sent;
+}
+
+static inline int mentalP2PConnect(MentalP2PServer *srv, const char *ip)
+{
+    if (!srv || srv->discovery_fd < 0 || !ip) return -1;
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) != 1) {
+        mentalP2PLog(srv, MT_BRED, "[p2p] invalid IP: %s", ip);
+        return -1;
+    }
+
+    char packet[128];
+    mentalP2PBuildPacket(packet, sizeof(packet));
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(P2P_DEFAULT_PORT);
+    dest.sin_addr   = addr;
+
+    ssize_t n = sendto(srv->discovery_fd, packet, strlen(packet), 0,
+                       (struct sockaddr*)&dest, sizeof(dest));
+    if (n > 0) {
+        mentalP2PLog(srv, MT_BBLACK, "[p2p] unicast -> %s:%d",
+                     ip, P2P_DEFAULT_PORT);
+        return 0;
+    }
+    mentalP2PLog(srv, MT_BRED, "[p2p] sendto failed: %s", strerror(errno));
+    return -1;
+}
+
+static inline int mentalP2PPoll(MentalP2PServer *srv)
+{
+    if (!srv || srv->discovery_fd < 0) return 0;
+
+    char buf[256];
+    struct sockaddr_in sender;
+    socklen_t sender_len = sizeof(sender);
+
+    ssize_t n = recvfrom(srv->discovery_fd, buf, sizeof(buf) - 1,
+                         MSG_DONTWAIT,
+                         (struct sockaddr*)&sender, &sender_len);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    if (strncmp(buf, P2P_MAGIC, strlen(P2P_MAGIC)) != 0)
+        return 0;
+
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &sender.sin_addr, ip_str, sizeof(ip_str));
+    unsigned short port = ntohs(sender.sin_port);
+
+    if (mentalP2PIsSelfIp(ip_str)) return 0;
+
+    for (int i = 0; i < srv->peer_count; i++)
+        if (strcmp(srv->peers[i].ip, ip_str) == 0) return 0;
+
+    if (srv->peer_count >= P2P_MAX_PEERS) {
+        mentalP2PLog(srv, MT_BYELLOW, "[p2p] peer table full");
+        return 0;
+    }
+
+    MentalP2PPeer *p = &srv->peers[srv->peer_count++];
+    strncpy(p->ip, ip_str, sizeof(p->ip) - 1);
+    p->ip[sizeof(p->ip) - 1] = '\0';
+    p->port = port;
+
+    mentalP2PLog(srv, MT_BGREEN, "[p2p] discovered peer %s:%u (%d total)",
+                 p->ip, p->port, srv->peer_count);
+    return 1;
+}
+
+/* ---- TUI ↔ P2P glue -------------------------------------------- */
+static inline void mentalTuiBindP2PSink(MentalTui *tui, MentalP2PServer *srv)
+{
+    if (!tui || !srv) return;
+    tui->p2p_sink       = mental_sink_tui(tui);
+    tui->p2p_sink_ready = 1;
+    mentalP2PSetLogSink(srv, &tui->p2p_sink);
+}
+
+/* ============================================================
+ *  Background process spawning
+ * ============================================================ */
 static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
 {
     if (!tui || !cmd) return -1;
@@ -354,6 +682,9 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
     }
 }
 
+/* ============================================================
+ *  Frame rendering
+ * ============================================================ */
 static inline void mentalTuiFlush(MentalTui *tui)
 {
     if (!tui) return;
@@ -506,7 +837,7 @@ static inline void mentalTuiRun(MentalTui *tui)
 {
     if (!tui) return;
 
-    struct pollfd fds[MT_MAX_PROCS + 1];
+    struct pollfd fds[MT_MAX_PROCS + 2];
     while (tui->running) {
         mentalTuiDrainProcs(tui);
 
@@ -514,6 +845,7 @@ static inline void mentalTuiRun(MentalTui *tui)
         fds[0].fd     = STDIN_FILENO;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
+
         for (int i = 0; i < MT_MAX_PROCS; i++) {
             if (tui->procs[i].used && tui->procs[i].fd >= 0) {
                 fds[nfds].fd      = tui->procs[i].fd;
@@ -521,6 +853,15 @@ static inline void mentalTuiRun(MentalTui *tui)
                 fds[nfds].revents = 0;
                 nfds++;
             }
+        }
+
+        int p2p_idx = -1;
+        if (tui->p2p && tui->p2p->initialized && tui->p2p->discovery_fd >= 0) {
+            p2p_idx = nfds;
+            fds[nfds].fd      = tui->p2p->discovery_fd;
+            fds[nfds].events  = POLLIN;
+            fds[nfds].revents = 0;
+            nfds++;
         }
 
         int r = poll(fds, (nfds_t)nfds, 16);
@@ -539,6 +880,9 @@ static inline void mentalTuiRun(MentalTui *tui)
         for (int i = 1; i < nfds; i++) {
             if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
                 tui->dirty = 1;
+                if (i == p2p_idx && tui->p2p) {
+                    while (mentalP2PPoll(tui->p2p) > 0) {}
+                }
                 break;
             }
         }
@@ -547,11 +891,139 @@ static inline void mentalTuiRun(MentalTui *tui)
     }
 }
 
-/* ---- Built-ins ------------------------------------------------- */
+/* ============================================================
+ *  System / network info  (sink-based)
+ * ============================================================ */
+static inline int __mental_sysctl_int(const char *pName, int *pOut)
+{
+    size_t len = sizeof(*pOut);
+    return sysctlbyname(pName, pOut, &len, NULL, 0);
+}
+
+static inline int __mental_sysctl_str(const char *pName, char *pBuf, size_t buflen)
+{
+    size_t len = buflen;
+    return sysctlbyname(pName, pBuf, &len, NULL, 0);
+}
+
+static inline void mental_print_network_info_sink(MentalSink *s)
+{
+    struct ifaddrs *ifaddr, *ifa;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        mental_sink_printf(s, MT_BRED, "getifaddrs: %s", strerror(errno));
+        return;
+    }
+
+    mental_sink_printf(s, MT_BYELLOW, "---- Network Interfaces ----");
+
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        int family = ifa->ifa_addr->sa_family;
+        if (family != AF_INET && family != AF_INET6) continue;
+
+        char host[NI_MAXHOST];
+        int rc = getnameinfo(ifa->ifa_addr,
+                             (family == AF_INET) ? sizeof(struct sockaddr_in)
+                                                 : sizeof(struct sockaddr_in6),
+                             host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+        if (rc != 0) {
+            mental_sink_printf(s, MT_BRED, "  %-10s getnameinfo: %s",
+                               ifa->ifa_name, gai_strerror(rc));
+            continue;
+        }
+        mental_sink_printf(s, MT_WHITE, "  %-10s %-4s  %s",
+                           ifa->ifa_name,
+                           (family == AF_INET) ? "IPv4" : "IPv6",
+                           host);
+    }
+
+    mental_sink_printf(s, MT_BYELLOW, "  --- Interface flags ---");
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        char flags[128] = {0};
+        size_t off = 0;
+        if (ifa->ifa_flags & IFF_UP)        off += snprintf(flags+off, sizeof flags - off, "UP ");
+        if (ifa->ifa_flags & IFF_RUNNING)   off += snprintf(flags+off, sizeof flags - off, "RUNNING ");
+        if (ifa->ifa_flags & IFF_LOOPBACK)  off += snprintf(flags+off, sizeof flags - off, "LOOPBACK ");
+        if (ifa->ifa_flags & IFF_BROADCAST) off += snprintf(flags+off, sizeof flags - off, "BROADCAST ");
+        if (ifa->ifa_flags & IFF_MULTICAST) off += snprintf(flags+off, sizeof flags - off, "MULTICAST ");
+        mental_sink_printf(s, MT_WHITE, "  %-10s flags: 0x%x (%s)",
+                           ifa->ifa_name, ifa->ifa_flags, flags);
+    }
+
+    mental_sink_printf(s, MT_BYELLOW, "----------------------------");
+    freeifaddrs(ifaddr);
+}
+
+static inline void mental_print_system_info_sink(MentalSink *s)
+{
+    struct utsname u;
+    if (uname(&u) == 0) {
+        mental_sink_printf(s, MT_BYELLOW, "---- System (uname) ----");
+        mental_sink_printf(s, MT_WHITE, "  sysname  : %s", u.sysname);
+        mental_sink_printf(s, MT_WHITE, "  nodename : %s", u.nodename);
+        mental_sink_printf(s, MT_WHITE, "  release  : %s", u.release);
+        mental_sink_printf(s, MT_WHITE, "  version  : %s", u.version);
+        mental_sink_printf(s, MT_WHITE, "  machine  : %s", u.machine);
+    } else {
+        mental_sink_printf(s, MT_BRED, "uname: %s", strerror(errno));
+    }
+
+    mental_sink_printf(s, MT_BYELLOW, "---- Hardware (sysctl) ----");
+
+    int ncpu = 0;
+    if (__mental_sysctl_int("hw.ncpu", &ncpu) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.ncpu        : %d", ncpu);
+
+    int physmem = 0;
+    if (__mental_sysctl_int("hw.physmem", &physmem) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.physmem     : %d bytes (%.2f GiB)",
+                           physmem, physmem / (1024.0 * 1024.0 * 1024.0));
+
+    int pagesize = 0;
+    if (__mental_sysctl_int("hw.pagesize", &pagesize) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.pagesize    : %d bytes", pagesize);
+
+    char model[256] = {0};
+    if (__mental_sysctl_str("hw.model", model, sizeof model) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.model       : %s", model);
+
+    char machine[256] = {0};
+    if (__mental_sysctl_str("hw.machine", machine, sizeof machine) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.machine     : %s", machine);
+
+    mental_print_network_info_sink(s);
+}
+
+static inline void mental_print_network_info(void)
+{
+    MentalSink s = mental_sink_stdout();
+    mental_print_network_info_sink(&s);
+}
+static inline void mental_print_system_info(void)
+{
+    MentalSink s = mental_sink_stdout();
+    mental_print_system_info_sink(&s);
+}
+
+/* ============================================================
+ *  Built-in TUI commands
+ * ============================================================ */
 static inline void mentalTuiBuiltinShowInfo(MentalTui *tui, int argc, char **argv, void *u)
 {
-  (void)argc; (void)argv; (void)u;
-  mentalTuiPrintf(tui, MT_WHITE, "MENTAL INSTANCE INFO\n");
+    (void)argc; (void)argv; (void)u;
+    MentalSink s = mental_sink_tui(tui);
+    mental_sink_printf(&s, MT_BYELLOW, "==== MENTAL INSTANCE INFO ====");
+    mental_print_system_info_sink(&s);
+    mental_sink_printf(&s, MT_BYELLOW, "==============================");
+}
+
+static inline void mentalTuiBuiltinNetInfo(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+    MentalSink s = mental_sink_tui(tui);
+    mental_print_network_info_sink(&s);
 }
 
 static inline void mentalTuiBuiltinHelp(MentalTui *tui, int argc, char **argv, void *u)
@@ -579,6 +1051,153 @@ static inline void mentalTuiBuiltinQuit(MentalTui *tui, int argc, char **argv, v
     tui->running = 0;
 }
 
+static inline void mentalTuiShowFreebsdIco(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+
+    static const char *logo[] = {
+        " ```                        ` ",
+        "  ` `.....---.......--.```   -/ ",
+        "  +o   .--`         /y:`      +. ",
+        "  yo`:.            :o      `+- ",
+        "   y/               -/`   -o/ ",
+        "  .-                  ::/sy+:. ",
+        "  /                     `--  / ",
+        " `:                          :` ",
+        " `:                          :` ",
+        "  /                          / ",
+        "  .-                        -. ",
+        "   --                      -- ",
+        "    `:`                  `:` ",
+        "      .--             `--. ",
+        "         .---.....----. ",
+    };
+
+    const int logo_lines = (int)(sizeof(logo) / sizeof(logo[0]));
+
+    mentalTuiPrintf(tui, MT_BCYAN, "");
+    for (int i = 0; i < logo_lines; i++)
+        mentalTuiPrintf(tui, MT_BRED, "%s", logo[i]);
+
+    mentalTuiPrintf(tui, MT_BYELLOW, "        FreeBSD");
+    mentalTuiPrintf(tui, MT_WHITE,  "  The Power To Serve");
+    mentalTuiPrintf(tui, MT_BBLACK, "");
+}
+
+/* ---- P2P TUI commands ------------------------------------------- */
+static inline void mentalTuiBuiltinP2PStart(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+
+    if (tui->p2p && tui->p2p->initialized) {
+        mentalTuiPrintf(tui, MT_BYELLOW,
+                        "[p2p] already running on UDP port %d", P2P_DEFAULT_PORT);
+        return;
+    }
+
+    MentalP2PServer *srv = mentalP2PCreate();
+    if (!srv) {
+        mentalTuiPrintf(tui, MT_BRED,
+                        "[p2p] failed to start (see message above)");
+        return;
+    }
+
+    mentalTuiBindP2PSink(tui, srv);
+    tui->p2p = srv;
+
+    if (tui->p2p_notify)
+        tui->p2p_notify(tui->p2p_notify_ctx, srv);
+
+    mentalTuiPrintf(tui, MT_BGREEN,
+                    "[p2p] server started on UDP port %d", P2P_DEFAULT_PORT);
+}
+
+static inline void mentalTuiBuiltinP2PStop(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+
+    if (!tui->p2p) {
+        mentalTuiPrintf(tui, MT_BYELLOW, "[p2p] not running");
+        return;
+    }
+
+    int peers = tui->p2p->peer_count;
+    mentalP2PDestroy(tui->p2p);
+    tui->p2p            = NULL;
+    tui->p2p_sink_ready = 0;
+
+    if (tui->p2p_notify)
+        tui->p2p_notify(tui->p2p_notify_ctx, NULL);
+
+    mentalTuiPrintf(tui, MT_BGREEN,
+                    "[p2p] stopped (dropped %d peer(s))", peers);
+}
+
+static inline void mentalTuiBuiltinP2PStatus(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+
+    if (!tui->p2p || !tui->p2p->initialized) {
+        mentalTuiPrintf(tui, MT_YELLOW, "p2p: stopped");
+        return;
+    }
+
+    mentalTuiPrintf(tui, MT_GREEN, "p2p: running");
+    mentalTuiPrintf(tui, MT_WHITE, "  port  : UDP %d", P2P_DEFAULT_PORT);
+    mentalTuiPrintf(tui, MT_WHITE, "  fd    : %d", tui->p2p->discovery_fd);
+    mentalTuiPrintf(tui, MT_WHITE, "  peers : %d / %d",
+                    tui->p2p->peer_count, P2P_MAX_PEERS);
+}
+
+static inline void mentalTuiBuiltinPing(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+    if (!tui->p2p || !tui->p2p->initialized) {
+        mentalTuiPrintf(tui, MT_BYELLOW,
+                        "[p2p] not running — try 'p2p-start' first");
+        return;
+    }
+    int n = mentalP2PPing(tui->p2p);
+    if (n == 0)
+        mentalTuiPrintf(tui, MT_BYELLOW, "[p2p] no packets sent");
+}
+
+static inline void mentalTuiBuiltinConnect(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)u;
+    if (argc < 2) {
+        mentalTuiPrintf(tui, MT_BYELLOW, "usage: connect <ip>");
+        return;
+    }
+    if (!tui->p2p || !tui->p2p->initialized) {
+        mentalTuiPrintf(tui, MT_BYELLOW,
+                        "[p2p] not running — try 'p2p-start' first");
+        return;
+    }
+    mentalP2PConnect(tui->p2p, argv[1]);
+}
+
+static inline void mentalTuiBuiltinPeers(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+    if (!tui->p2p || !tui->p2p->initialized) {
+        mentalTuiPrintf(tui, MT_BYELLOW,
+                        "[p2p] not running — try 'p2p-start' first");
+        return;
+    }
+    mentalTuiPrintf(tui, MT_BYELLOW, "---- Known Peers (%d/%d) ----",
+                    tui->p2p->peer_count, P2P_MAX_PEERS);
+    if (tui->p2p->peer_count == 0) {
+        mentalTuiPrintf(tui, MT_BBLACK, "  (none — try 'ping')");
+    } else {
+        for (int i = 0; i < tui->p2p->peer_count; i++) {
+            mentalTuiPrintf(tui, MT_WHITE, "  %2d. %s:%u", i + 1,
+                            tui->p2p->peers[i].ip,
+                            tui->p2p->peers[i].port);
+        }
+    }
+}
+
 static inline void mentalTuiBuiltinExit(MentalTui *tui, int argc, char **argv, void *u)
 {
     (void)u;
@@ -589,48 +1208,91 @@ static inline void mentalTuiBuiltinExit(MentalTui *tui, int argc, char **argv, v
     tui->running = 0;
 }
 
-
 static inline void mentalTuiRegisterBuiltins(MentalTui *tui)
 {
-    mentalTuiRegister(tui, "show-info", "Show mental instance info", mentalTuiBuiltinShowInfo, NULL);
-    mentalTuiRegister(tui, "help",  "list commands", mentalTuiBuiltinHelp,  NULL);
-    mentalTuiRegister(tui, "clear", "clear output",  mentalTuiBuiltinClear, NULL);
-    mentalTuiRegister(tui, "quit",  "exit the TUI",  mentalTuiBuiltinQuit,  NULL);
-    mentalTuiRegister(tui, "exit",  "exit [code]",   mentalTuiBuiltinExit,  NULL);
+    mentalTuiRegister(tui, "freebsd",    "show freebsd ascii logo",  mentalTuiShowFreebsdIco,   NULL);
+    mentalTuiRegister(tui, "show-info",  "show mental instance info", mentalTuiBuiltinShowInfo,  NULL);
+    mentalTuiRegister(tui, "net-info",   "show network interfaces",  mentalTuiBuiltinNetInfo,   NULL);
+
+    mentalTuiRegister(tui, "p2p-start",  "start P2P UDP server",     mentalTuiBuiltinP2PStart,  NULL);
+    mentalTuiRegister(tui, "p2p-stop",   "stop P2P UDP server",      mentalTuiBuiltinP2PStop,   NULL);
+    mentalTuiRegister(tui, "p2p-status", "show P2P server status",   mentalTuiBuiltinP2PStatus, NULL);
+    mentalTuiRegister(tui, "ping",       "broadcast P2P discovery",  mentalTuiBuiltinPing,      NULL);
+    mentalTuiRegister(tui, "connect",    "connect <ip> (unicast)",   mentalTuiBuiltinConnect,   NULL);
+    mentalTuiRegister(tui, "peers",      "list known P2P peers",     mentalTuiBuiltinPeers,     NULL);
+
+    mentalTuiRegister(tui, "help",       "list commands",            mentalTuiBuiltinHelp,      NULL);
+    mentalTuiRegister(tui, "clear",      "clear output",             mentalTuiBuiltinClear,     NULL);
+    mentalTuiRegister(tui, "quit",       "exit the TUI",             mentalTuiBuiltinQuit,      NULL);
+    mentalTuiRegister(tui, "exit",       "exit [code]",              mentalTuiBuiltinExit,      NULL);
 }
 
 /* ============================================================
  *  Instance / lifecycle
  * ============================================================ */
 typedef struct MentalInstanceInfo {
-    const char             *pApplicationName;
-    enum MentalInterfaceType eInterfaceType;
+    const char               *pApplicationName;
+    enum MentalInterfaceType  eInterfaceType;
 } MentalInstanceInfo;
 
 typedef struct MentalInstance {
     MentalInstanceInfo *pInfo;
-    MentalTui          *pTui;   /* populated when eInterfaceType == TUI */
+    MentalTui          *pTui;
+    MentalP2PServer    *pP2P;
 } MentalInstance;
+
+/* Called by the TUI whenever P2P is created or destroyed.
+ * Keeps MentalInstance::pP2P live without the TUI having to
+ * know the layout of MentalInstance. */
+static inline void mental_instance_p2p_notify(void *ctx, MentalP2PServer *srv)
+{
+    MentalInstance *inst = (MentalInstance *)ctx;
+    if (inst) inst->pP2P = srv;
+}
 
 static inline enum MentalResult mental_instance_create(MentalInstance *pInstance)
 {
-    if (!pInstance)          return MENTAL_RESULT_TYPE_POINTER_IS_NULL;
-    if (!pInstance->pInfo)   return MENTAL_RESULT_TYPE_NO_INFO_POINTER;
+    if (!pInstance)         return MENTAL_RESULT_TYPE_POINTER_IS_NULL;
+    if (!pInstance->pInfo)  return MENTAL_RESULT_TYPE_NO_INFO_POINTER;
 
     if (pInstance->pInfo->eInterfaceType == MENTAL_INTERFACE_TUI) {
         MentalTui *tui = mentalTuiCreate(0, 0);
         if (!tui) return MENTAL_RESULT_TYPE_POINTER_IS_NULL;
+
+        tui->p2p              = NULL;
+        tui->p2p_notify       = mental_instance_p2p_notify;
+        tui->p2p_notify_ctx   = pInstance;
+        pInstance->pP2P       = NULL;
+
         mentalTuiRegisterBuiltins(tui);
         pInstance->pTui = tui;
         mentalTuiRun(tui);
+
+        /* Session ended: mirror final TUI P2P state outward. */
+        pInstance->pP2P = tui->p2p;
     }
     return MENTAL_RESULT_TYPE_OK;
 }
 
-void mental_instance_destroy(MentalInstance *pInstance);
+static inline void mental_instance_destroy(MentalInstance *pInstance)
+{
+    if (!pInstance) return;
+
+    if (pInstance->pTui) {
+        if (pInstance->pTui->p2p) {
+            mentalP2PDestroy(pInstance->pTui->p2p);
+            pInstance->pTui->p2p = NULL;
+        }
+        pInstance->pTui->p2p_notify     = NULL;
+        pInstance->pTui->p2p_notify_ctx = NULL;
+        mentalTuiDestroy(pInstance->pTui);
+        pInstance->pTui = NULL;
+    }
+    pInstance->pP2P = NULL;
+}
 
 /* ============================================================
- *  Function queue
+ *  Function queue (declarations only)
  * ============================================================ */
 typedef enum FunctionQueueType FunctionQueueType;
 typedef struct FunctionInfo FunctionInfo;
@@ -643,15 +1305,7 @@ FunctionInfo  *mental_fqueue_getf_by_id(const char *uuid);
 void           mental_fqueue_add_f(FunctionInfo *pInfo);
 
 /* ============================================================
- *  System / network info
- * ============================================================ */
-int  __mental_sysctl_int(const char *pName, int *pOut);
-int  __mental_sysctl_str(const char *pName, char *pBuf, size_t buflen);
-void mental_print_network_info(void);
-void mental_print_system_info(void);
-
-/* ============================================================
- *  Logging
+ *  Logging (declarations only)
  * ============================================================ */
 typedef struct MentalLogger MentalLogger;
 int  mental_logger_initialize(const char *pLogFilePath);
@@ -667,7 +1321,7 @@ int __mental_logger_write_fl(const char *pFile, int line,
 #define logf(...) __mental_logger_write_fl(__FILE__, __LINE__, __func__, __VA_ARGS__)
 
 /* ============================================================
- *  Window manager / GL
+ *  Window manager / GL (declarations only)
  * ============================================================ */
 typedef struct MentalWindowManager MentalWindowManager;
 MentalWindowManager *mental_wm_initialize(void);
@@ -680,21 +1334,5 @@ void mental_print_gl_info(void);
 void mental_set_clear_color_rgb(unsigned char r, unsigned int g,
                                 unsigned char b, unsigned char a);
 void mental_enable_core_defaults(void);
-
-/* ============================================================
- *  P2P
- * ============================================================ */
-#define P2P_DEFAULT_PORT 31337
-#define P2P_MAX_PEERS    64
-
-typedef struct MentalP2PPackage MentalP2PPackage;
-typedef struct MentalP2PPeer    MentalP2PPeer;
-typedef struct MentalP2PServer  MentalP2PServer;
-
-MentalP2PServer *mental_p2p_initialize(void);
-void mental_p2p_destroy(void);
-void mental_p2p_connect(void);
-void mental_p2p_ping(void);
-void mental_p2p_poll(void);
 
 #endif /* MENTAL_FRAMEWORK_H */
