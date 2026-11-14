@@ -7,10 +7,17 @@
 #define ENABLE_OPENGL_BACKEND
 #define ENABLE_VULKAN_BACKEND
 
+/* Backend API versions. Both backends may be enabled at once; the renderer
+ * chooses one at runtime. Macros (not static arrays) avoid unused-variable
+ * warnings in every translation unit. */
 #if defined(ENABLE_OPENGL_BACKEND)
-  static const int OPENGL_VERSION[2] = { 3, 3 };
-#elif defined(ENABLE_VULKAN_BACKEND)
-  static const int VULKAN_API_VERSION[2] = { 1, 3 };
+#  define MENTAL_OPENGL_VERSION_MAJOR 3
+#  define MENTAL_OPENGL_VERSION_MINOR 3
+#endif
+
+#if defined(ENABLE_VULKAN_BACKEND)
+#  define MENTAL_VULKAN_API_VERSION_MAJOR 1
+#  define MENTAL_VULKAN_API_VERSION_MINOR 3
 #endif
 
 #define MENTAL_FRAMEWORK_MAJOR_VERSION 1
@@ -27,29 +34,13 @@
 #define MT_LINE_LEN       512
 #define MT_MAX_PROCS        8
 #define MT_INPUT_LEN      512
-#define MT_MAX_COMMANDS    64   /* bumped to fit plugin commands */
+#define MT_MAX_COMMANDS    32
 
 /* P2P tunables */
 #define P2P_DEFAULT_PORT 31337
 #define P2P_MAX_PEERS    64
 #define P2P_MAGIC        "MENTAL"
 #define P2P_VERSION      "1"
-
-/* Auth tunables */
-#define MENTAL_AUTH_MAX_USERS        16
-#define MENTAL_AUTH_SALT_LEN         16
-#define MENTAL_AUTH_HASH_LEN         32
-#define MENTAL_AUTH_ITERATIONS    20000
-#define MENTAL_AUTH_FILE_DEFAULT  ".mental_auth.dat"
-#define MENTAL_AUTH_MAX_ATTEMPTS      3
-#define MENTAL_AUTH_OBFUSCATION_KEY  0x5A3C91E7u
-
-/* Plugin tunables */
-#define MENTAL_PLUGIN_ABI_VERSION   1
-#define MENTAL_PLUGIN_MAX           32
-#define MENTAL_PLUGIN_NAME_LEN      64
-#define MENTAL_PLUGIN_PATH_LEN      512
-#define MENTAL_PLUGIN_ENTRY_SYMBOL  "mental_plugin_entry"
 
 /* ============================================================
  *  ANSI escapes
@@ -70,7 +61,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -81,16 +71,21 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/utsname.h>
-#include <sys/sysctl.h>
+#if defined(__linux__)
+#  include <sys/sysinfo.h>
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+#  include <sys/sysctl.h>
+#  include <net/route.h>
+#  include <net/if_dl.h>
+#else
+#  include <sys/sysctl.h>
+#endif
 #include <poll.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <dlfcn.h>
-#include <dirent.h>
-#include <limits.h>
 
 /* ============================================================
  *  Core enums / result codes
@@ -157,53 +152,6 @@ static inline MentalSink mental_sink_stdout(void)
 }
 
 /* ============================================================
- *  Auth: types
- * ============================================================ */
-typedef enum MentalAuthResult {
-    MENTAL_AUTH_OK              =  0,
-    MENTAL_AUTH_ERR_NO_FILE     = -1,
-    MENTAL_AUTH_ERR_CORRUPT     = -2,
-    MENTAL_AUTH_ERR_USER_EXISTS = -3,
-    MENTAL_AUTH_ERR_NO_USER     = -4,
-    MENTAL_AUTH_ERR_BAD_PASS    = -5,
-    MENTAL_AUTH_ERR_TOO_MANY    = -6,
-    MENTAL_AUTH_ERR_IO          = -7,
-    MENTAL_AUTH_ERR_FULL        = -8,
-} MentalAuthResult;
-
-typedef struct MentalAuthUser {
-    char          username[MAX_TUI_USERNAME_LENGTH + 1];
-    unsigned char salt[MENTAL_AUTH_SALT_LEN];
-    unsigned char hash[MENTAL_AUTH_HASH_LEN];
-    int           used;
-} MentalAuthUser;
-
-typedef struct MentalAuthStore {
-    MentalAuthUser users[MENTAL_AUTH_MAX_USERS];
-    int            user_count;
-    char           file_path[512];
-    int            initialized;
-} MentalAuthStore;
-
-typedef enum MentalAuthState {
-    MENTAL_AUTH_STATE_LOGIN    = 0,
-    MENTAL_AUTH_STATE_REGISTER = 1,
-    MENTAL_AUTH_STATE_DONE     = 2,
-} MentalAuthState;
-
-typedef struct MentalAuthSession {
-    MentalAuthStore *store;
-    MentalAuthState  state;
-    char             username[MAX_TUI_USERNAME_LENGTH + 1];
-    char             password[MAX_TUI_PASSWORD_LENGTH + 1];
-    int              field;
-    int              attempts;
-    int              is_registering;
-    char             error[128];
-    int              have_error;
-} MentalAuthSession;
-
-/* ============================================================
  *  TUI data types
  * ============================================================ */
 struct MentalTui;
@@ -226,6 +174,8 @@ typedef struct MTProc {
     int   fd;
     int   used;
     int   eof_seen;
+    char   linebuf[MT_LINE_LEN];   /* partial output line from the pipe */
+    size_t line_len;
 } MTProc;
 
 /* ---- P2P types (must precede MentalTui) ------------------------- */
@@ -240,15 +190,11 @@ typedef struct MentalP2PServer {
     int            peer_count;
     MentalSink    *log_sink;
     int            initialized;
-    struct MentalTui *tui_owner;   /* back-pointer for plugin notifications */
 } MentalP2PServer;
 
 /* Notify callback: TUI invokes it whenever P2P is created/destroyed,
  * letting external owners (e.g. MentalInstance) mirror the pointer. */
 typedef void (*MentalP2PNotifyFn)(void *ctx, MentalP2PServer *srv);
-
-/* ---- Plugin forward decls (needed by MentalTui) ----------------- */
-typedef struct MentalPluginManager MentalPluginManager;
 
 typedef struct MentalTui {
     int width, height;
@@ -261,6 +207,7 @@ typedef struct MentalTui {
     char input[MT_INPUT_LEN];
     int  input_len;
     int  input_cursor;
+    int  esc_state;   /* 0 idle, 1 after ESC, 2 inside a CSI sequence */
 
     MTProc procs[MT_MAX_PROCS];
 
@@ -280,595 +227,37 @@ typedef struct MentalTui {
     MentalP2PNotifyFn   p2p_notify;
     void               *p2p_notify_ctx;
 
-    MentalAuthSession   auth;
-    int                 authenticated;
-
-    MentalPluginManager *plugins;   /* optional; NULL disables plugin system */
-
     int dirty;
 } MentalTui;
 
 /* ============================================================
- *  Auth: primitives  (Base64, XOR, salted iterated hash)
+ *  Network map
  * ============================================================ */
+#define MENTAL_MAP_MAX_DEVICES 128
+#define MENTAL_MAP_MAX_IFACES   16
 
-static inline void mental_auth_b64_encode(const unsigned char *in, size_t inlen,
-                                          char *out, size_t outlen)
-{
-    static const char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t o = 0;
-    for (size_t i = 0; i < inlen; i += 3) {
-        unsigned v = (unsigned)in[i] << 16;
-        if (i + 1 < inlen) v |= (unsigned)in[i + 1] << 8;
-        if (i + 2 < inlen) v |= (unsigned)in[i + 2];
+typedef enum MentalMapSource {
+    MENTAL_MAP_SELF = 1u << 0,
+    MENTAL_MAP_PEER = 1u << 1,
+    MENTAL_MAP_ARP  = 1u << 2
+} MentalMapSource;
 
-        if (o + 4 >= outlen) break;
-        out[o++] = tbl[(v >> 18) & 0x3F];
-        out[o++] = tbl[(v >> 12) & 0x3F];
-        out[o++] = (i + 1 < inlen) ? tbl[(v >> 6) & 0x3F] : '=';
-        out[o++] = (i + 2 < inlen) ? tbl[ v       & 0x3F] : '=';
-    }
-    out[o] = '\0';
-}
+typedef struct MentalMapDevice {
+    char           ip[INET_ADDRSTRLEN];
+    char           mac[18];
+    char           ifname[IFNAMSIZ];
+    unsigned       flags;
+    unsigned short port;       /* only meaningful for peers */
+} MentalMapDevice;
 
-static inline int mental_auth_b64_val(char c)
-{
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-static inline int mental_auth_b64_decode(const char *in, unsigned char *out, size_t outlen)
-{
-    size_t o = 0;
-    unsigned buf = 0;
-    int bits = 0;
-    for (const char *p = in; *p; p++) {
-        if (*p == '=') break;
-        int v = mental_auth_b64_val(*p);
-        if (v < 0) continue;
-        buf = (buf << 6) | (unsigned)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            if (o >= outlen) return -1;
-            out[o++] = (unsigned char)((buf >> bits) & 0xFF);
-        }
-    }
-    return (int)o;
-}
-
-static inline void mental_auth_xor(unsigned char *buf, size_t len, unsigned key)
-{
-    for (size_t i = 0; i < len; i++) {
-        buf[i] ^= (unsigned char)((key >> ((i & 3) * 8)) & 0xFF);
-        key = key * 1664525u + 1013904223u;
-    }
-}
-
-static inline void mental_auth_hash(const char *password,
-                                    const unsigned char *salt, size_t salt_len,
-                                    unsigned char *out, size_t out_len)
-{
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < salt_len; i++) {
-        h ^= salt[i];
-        h *= 1099511628211ull;
-    }
-    for (const char *p = password; *p; p++) {
-        h ^= (unsigned char)*p;
-        h *= 1099511628211ull;
-    }
-    for (int iter = 0; iter < MENTAL_AUTH_ITERATIONS; iter++) {
-        h ^= (uint64_t)iter * 0x9E3779B97F4A7C15ull;
-        h *= 1099511628211ull;
-        h ^= h >> 33;
-        h *= 0xC2B2AE3D27D4EB4Full;
-        h ^= h >> 29;
-    }
-    for (size_t i = 0; i < out_len; i++) {
-        h ^= (uint64_t)i * 0xBF58476D1CE4E5B9ull;
-        h *= 1099511628211ull;
-        h ^= h >> 31;
-        out[i] = (unsigned char)(h & 0xFF);
-    }
-}
-
-static inline int mental_auth_ct_eq(const unsigned char *a,
-                                    const unsigned char *b, size_t len)
-{
-    unsigned char d = 0;
-    for (size_t i = 0; i < len; i++) d |= a[i] ^ b[i];
-    return d == 0;
-}
-
-static inline void mental_auth_random_salt(unsigned char *out, size_t len)
-{
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, out, len);
-        close(fd);
-        if (n == (ssize_t)len) return;
-    }
-    uint64_t s = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32)
-               ^ (uintptr_t)out;
-    for (size_t i = 0; i < len; i++) {
-        s = s * 6364136223846793005ull + 1442695040888963407ull;
-        out[i] = (unsigned char)(s >> 33);
-    }
-}
-
-/* ============================================================
- *  Auth: hex helpers
- * ============================================================ */
-static inline void mental_auth_hex(const unsigned char *in, size_t n,
-                                   char *out, size_t outlen)
-{
-    static const char hx[] = "0123456789abcdef";
-    size_t o = 0;
-    for (size_t i = 0; i < n && o + 2 < outlen; i++) {
-        out[o++] = hx[(in[i] >> 4) & 0xF];
-        out[o++] = hx[ in[i]       & 0xF];
-    }
-    out[o] = '\0';
-}
-
-static inline int mental_auth_unhex(const char *in, unsigned char *out, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        char a = in[i * 2], b = in[i * 2 + 1];
-        int hi = (a >= '0' && a <= '9') ? a - '0'
-               : (a >= 'a' && a <= 'f') ? a - 'a' + 10
-               : (a >= 'A' && a <= 'F') ? a - 'A' + 10 : -1;
-        int lo = (b >= '0' && b <= '9') ? b - '0'
-               : (b >= 'a' && b <= 'f') ? b - 'a' + 10
-               : (b >= 'A' && b <= 'F') ? b - 'A' + 10 : -1;
-        if (hi < 0 || lo < 0) return -1;
-        out[i] = (unsigned char)((hi << 4) | lo);
-    }
-    return 0;
-}
-
-/* ============================================================
- *  Auth: persistence
- * ============================================================ */
-static inline int mental_auth_store_save(MentalAuthStore *s)
-{
-    if (!s || !s->initialized) return MENTAL_AUTH_ERR_IO;
-
-    char plain[8192];
-    size_t o = 0;
-    o += (size_t)snprintf(plain + o, sizeof(plain) - o, "MAUTH1\n");
-    for (int i = 0; i < MENTAL_AUTH_MAX_USERS; i++) {
-        if (!s->users[i].used) continue;
-        char hex_salt[MENTAL_AUTH_SALT_LEN * 2 + 1];
-        char hex_hash[MENTAL_AUTH_HASH_LEN * 2 + 1];
-        mental_auth_hex(s->users[i].salt, MENTAL_AUTH_SALT_LEN,
-                        hex_salt, sizeof(hex_salt));
-        mental_auth_hex(s->users[i].hash, MENTAL_AUTH_HASH_LEN,
-                        hex_hash, sizeof(hex_hash));
-        o += (size_t)snprintf(plain + o, sizeof(plain) - o, "%s:%s:%s\n",
-                              s->users[i].username, hex_salt, hex_hash);
-        if (o >= sizeof(plain) - 128) break;
-    }
-
-    size_t plen = o;
-    mental_auth_xor((unsigned char *)plain, plen, MENTAL_AUTH_OBFUSCATION_KEY);
-
-    size_t b64cap = (plen * 4) / 3 + 8;
-    char *b64 = (char *)malloc(b64cap);
-    if (!b64) return MENTAL_AUTH_ERR_IO;
-    mental_auth_b64_encode((unsigned char *)plain, plen, b64, b64cap);
-
-    int fd = open(s->file_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) { free(b64); return MENTAL_AUTH_ERR_IO; }
-    size_t blen = strlen(b64);
-    ssize_t w = write(fd, b64, blen);
-    close(fd);
-    free(b64);
-    return (w == (ssize_t)blen) ? MENTAL_AUTH_OK : MENTAL_AUTH_ERR_IO;
-}
-
-static inline int mental_auth_store_load(MentalAuthStore *s)
-{
-    if (!s) return MENTAL_AUTH_ERR_IO;
-    FILE *f = fopen(s->file_path, "rb");
-    if (!f) return MENTAL_AUTH_ERR_NO_FILE;
-
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 1 << 20) { fclose(f); return MENTAL_AUTH_ERR_CORRUPT; }
-
-    char *b64 = (char *)malloc((size_t)sz + 1);
-    if (!b64) { fclose(f); return MENTAL_AUTH_ERR_IO; }
-    size_t rd = fread(b64, 1, (size_t)sz, f);
-    fclose(f);
-    b64[rd] = '\0';
-
-    unsigned char plain[8192];
-    int plen = mental_auth_b64_decode(b64, plain, sizeof(plain));
-    free(b64);
-    if (plen <= 0) return MENTAL_AUTH_ERR_CORRUPT;
-
-    mental_auth_xor(plain, (size_t)plen, MENTAL_AUTH_OBFUSCATION_KEY);
-    plain[plen < (int)sizeof(plain) ? plen : (int)sizeof(plain) - 1] = '\0';
-
-    if (strncmp((char *)plain, "MAUTH1\n", 7) != 0)
-        return MENTAL_AUTH_ERR_CORRUPT;
-
-    s->user_count = 0;
-    char *save = NULL;
-    char *line = strtok_r((char *)plain + 7, "\n", &save);
-    while (line && s->user_count < MENTAL_AUTH_MAX_USERS) {
-        char *c1 = strchr(line, ':');
-        if (!c1) { line = strtok_r(NULL, "\n", &save); continue; }
-        char *c2 = strchr(c1 + 1, ':');
-        if (!c2) { line = strtok_r(NULL, "\n", &save); continue; }
-
-        *c1 = '\0'; *c2 = '\0';
-        const char *uname = line;
-        const char *hex_s = c1 + 1;
-        const char *hex_h = c2 + 1;
-
-        MentalAuthUser *u = &s->users[s->user_count];
-        memset(u, 0, sizeof(*u));
-        strncpy(u->username, uname, MAX_TUI_USERNAME_LENGTH);
-        u->username[MAX_TUI_USERNAME_LENGTH] = '\0';
-        if (mental_auth_unhex(hex_s, u->salt, MENTAL_AUTH_SALT_LEN) == 0 &&
-            mental_auth_unhex(hex_h, u->hash, MENTAL_AUTH_HASH_LEN) == 0) {
-            u->used = 1;
-            s->user_count++;
-        }
-        line = strtok_r(NULL, "\n", &save);
-    }
-
-    s->initialized = 1;
-    return MENTAL_AUTH_OK;
-}
-
-static inline MentalAuthResult mental_auth_store_init(MentalAuthStore *s,
-                                                     const char *path)
-{
-    if (!s) return MENTAL_AUTH_ERR_IO;
-    memset(s, 0, sizeof(*s));
-    if (path) strncpy(s->file_path, path, sizeof(s->file_path) - 1);
-    else      strncpy(s->file_path, MENTAL_AUTH_FILE_DEFAULT,
-                      sizeof(s->file_path) - 1);
-
-    MentalAuthResult r = (MentalAuthResult)mental_auth_store_load(s);
-    if (r == MENTAL_AUTH_ERR_NO_FILE) {
-        s->initialized = 1;
-        return MENTAL_AUTH_OK;
-    }
-    return r;
-}
-
-static inline MentalAuthUser *mental_auth_find_user(MentalAuthStore *s,
-                                                    const char *name)
-{
-    if (!s || !name) return NULL;
-    for (int i = 0; i < MENTAL_AUTH_MAX_USERS; i++)
-        if (s->users[i].used && strcmp(s->users[i].username, name) == 0)
-            return &s->users[i];
-    return NULL;
-}
-
-static inline MentalAuthResult mental_auth_register(MentalAuthStore *s,
-                                                    const char *name,
-                                                    const char *password)
-{
-    if (!s || !s->initialized || !name || !password)
-        return MENTAL_AUTH_ERR_IO;
-    if (!*name || !*password) return MENTAL_AUTH_ERR_IO;
-    if (mental_auth_find_user(s, name)) return MENTAL_AUTH_ERR_USER_EXISTS;
-
-    int slot = -1;
-    for (int i = 0; i < MENTAL_AUTH_MAX_USERS; i++)
-        if (!s->users[i].used) { slot = i; break; }
-    if (slot < 0) return MENTAL_AUTH_ERR_FULL;
-
-    MentalAuthUser *u = &s->users[slot];
-    memset(u, 0, sizeof(*u));
-    strncpy(u->username, name, MAX_TUI_USERNAME_LENGTH);
-    u->username[MAX_TUI_USERNAME_LENGTH] = '\0';
-    mental_auth_random_salt(u->salt, MENTAL_AUTH_SALT_LEN);
-    mental_auth_hash(password, u->salt, MENTAL_AUTH_SALT_LEN,
-                     u->hash, MENTAL_AUTH_HASH_LEN);
-    u->used = 1;
-    s->user_count++;
-
-    return (MentalAuthResult)mental_auth_store_save(s);
-}
-
-static inline MentalAuthResult mental_auth_login(MentalAuthStore *s,
-                                                 const char *name,
-                                                 const char *password)
-{
-    if (!s || !s->initialized) return MENTAL_AUTH_ERR_IO;
-    MentalAuthUser *u = mental_auth_find_user(s, name);
-    if (!u) return MENTAL_AUTH_ERR_NO_USER;
-
-    unsigned char h[MENTAL_AUTH_HASH_LEN];
-    mental_auth_hash(password, u->salt, MENTAL_AUTH_SALT_LEN,
-                     h, MENTAL_AUTH_HASH_LEN);
-    return mental_auth_ct_eq(h, u->hash, MENTAL_AUTH_HASH_LEN)
-         ? MENTAL_AUTH_OK
-         : MENTAL_AUTH_ERR_BAD_PASS;
-}
-
-static inline const char *mental_auth_result_str(MentalAuthResult r)
-{
-    switch (r) {
-        case MENTAL_AUTH_OK:              return "ok";
-        case MENTAL_AUTH_ERR_NO_FILE:     return "no credential file";
-        case MENTAL_AUTH_ERR_CORRUPT:     return "corrupt credential file";
-        case MENTAL_AUTH_ERR_USER_EXISTS: return "username already taken";
-        case MENTAL_AUTH_ERR_NO_USER:     return "no such user";
-        case MENTAL_AUTH_ERR_BAD_PASS:    return "wrong password";
-        case MENTAL_AUTH_ERR_TOO_MANY:    return "too many attempts";
-        case MENTAL_AUTH_ERR_IO:          return "I/O error";
-        case MENTAL_AUTH_ERR_FULL:        return "user table full";
-    }
-    return "unknown";
-}
-
-/* ============================================================
- *  Plugins
- * ============================================================ */
-
-typedef struct MentalPlugin      MentalPlugin;
-typedef struct MentalPluginHost  MentalPluginHost;
-
-/* ---- Host interface: what a plugin is allowed to call ------------- */
-typedef struct MentalPluginHostOps {
-    void (*register_command)(MentalPluginHost *h,
-                             const char *name, const char *help,
-                             MTCommandFn fn, void *user);
-    void (*print)(MentalPluginHost *h, int color, const char *fmt, ...);
-    MentalP2PServer *(*get_p2p)(MentalPluginHost *h);
-    void (*mark_dirty)(MentalPluginHost *h);
-    void *ctx;
-} MentalPluginHostOps;
-
-struct MentalPluginHost {
-    const MentalPluginHostOps *ops;
-    void                      *ctx;   /* MentalTui* */
-};
-
-/* ---- Plugin vtable ------------------------------------------------- */
-typedef struct MentalPluginVTable {
-    int  (*init)(MentalPlugin *self, MentalPluginHost *host);
-    void (*shutdown)(MentalPlugin *self);
-    void (*tick)(MentalPlugin *self, double dt_seconds);
-    int  (*on_command)(MentalPlugin *self, int argc, char **argv,
-                       MentalPluginHost *host);
-    void (*on_p2p_peer)(MentalPlugin *self, const MentalP2PPeer *peer,
-                        MentalPluginHost *host);
-} MentalPluginVTable;
-
-struct MentalPlugin {
-    const MentalPluginVTable *vtable;
-    const char               *name;
-    const char               *version;
-    const char               *description;
-    void                     *handle;
-    void                     *user_data;
-    int                       abi_version;
-    int                       active;
-};
-
-typedef MentalPlugin *(*MentalPluginEntryFn)(int host_abi_version);
-
-#define MENTAL_PLUGIN_EXPORT(fn_name)                       \
-    __attribute__((visibility("default")))                  \
-    MentalPlugin *mental_plugin_entry(int host_abi_version)
-
-typedef struct MentalPluginManager {
-    MentalPlugin *plugins[MENTAL_PLUGIN_MAX];
-    int           count;
-    MentalPluginHost host;
-    MentalTui        *tui;
-} MentalPluginManager;
-
-/* Forward decls of host op bodies (defined after TUI helpers) */
-static inline void mental_plugin_host_register_command(MentalPluginHost *h,
-                                                       const char *name,
-                                                       const char *help,
-                                                       MTCommandFn fn,
-                                                       void *user);
-static inline void mental_plugin_host_print(MentalPluginHost *h, int color,
-                                            const char *fmt, ...);
-static inline MentalP2PServer *mental_plugin_host_get_p2p(MentalPluginHost *h);
-static inline void mental_plugin_host_mark_dirty(MentalPluginHost *h);
-
-static const MentalPluginHostOps MENTAL_PLUGIN_HOST_OPS = {
-    mental_plugin_host_register_command,
-    mental_plugin_host_print,
-    mental_plugin_host_get_p2p,
-    mental_plugin_host_mark_dirty,
-    NULL,
-};
-
-static inline MentalPluginManager *mentalPluginManagerCreate(MentalTui *tui)
-{
-    MentalPluginManager *m = calloc(1, sizeof(*m));
-    if (!m) return NULL;
-    m->tui = tui;
-    m->host.ops = &MENTAL_PLUGIN_HOST_OPS;
-    m->host.ctx = tui;
-    return m;
-}
-
-static inline void mentalPluginManagerDestroy(MentalPluginManager *m)
-{
-    if (!m) return;
-    for (int i = 0; i < m->count; i++) {
-        MentalPlugin *p = m->plugins[i];
-        if (!p) continue;
-        if (p->active && p->vtable && p->vtable->shutdown)
-            p->vtable->shutdown(p);
-        if (p->handle) dlclose(p->handle);
-        free(p);
-        m->plugins[i] = NULL;
-    }
-    m->count = 0;
-    free(m);
-}
-
-static inline MentalPlugin *mentalPluginFind(MentalPluginManager *m, const char *name)
-{
-    if (!m || !name) return NULL;
-    for (int i = 0; i < m->count; i++)
-        if (m->plugins[i] && strcmp(m->plugins[i]->name, name) == 0)
-            return m->plugins[i];
-    return NULL;
-}
-
-static inline int mentalPluginLoad(MentalPluginManager *m, const char *path,
-                                   char *errbuf, size_t errlen)
-{
-    if (!m || !path) return -1;
-
-    if (m->count >= MENTAL_PLUGIN_MAX) {
-        if (errbuf) snprintf(errbuf, errlen, "plugin table full");
-        return -1;
-    }
-
-    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) {
-        if (errbuf) snprintf(errbuf, errlen, "dlopen: %s", dlerror());
-        return -1;
-    }
-
-    dlerror();
-    MentalPluginEntryFn entry =
-        (MentalPluginEntryFn)dlsym(h, MENTAL_PLUGIN_ENTRY_SYMBOL);
-    const char *sym_err = dlerror();
-    if (sym_err || !entry) {
-        if (errbuf) snprintf(errbuf, errlen, "missing %s: %s",
-                             MENTAL_PLUGIN_ENTRY_SYMBOL, sym_err ? sym_err : "?");
-        dlclose(h);
-        return -1;
-    }
-
-    MentalPlugin *p = entry(MENTAL_PLUGIN_ABI_VERSION);
-    if (!p) {
-        if (errbuf) snprintf(errbuf, errlen, "entry returned NULL");
-        dlclose(h);
-        return -1;
-    }
-    if (p->abi_version != MENTAL_PLUGIN_ABI_VERSION) {
-        if (errbuf) snprintf(errbuf, errlen,
-                             "abi mismatch: plugin=%d host=%d",
-                             p->abi_version, MENTAL_PLUGIN_ABI_VERSION);
-        dlclose(h);
-        return -1;
-    }
-    if (mentalPluginFind(m, p->name)) {
-        if (errbuf) snprintf(errbuf, errlen, "plugin '%s' already loaded", p->name);
-        dlclose(h);
-        return -1;
-    }
-
-    p->handle = h;
-    if (p->vtable && p->vtable->init) {
-        int rc = p->vtable->init(p, &m->host);
-        if (rc != 0) {
-            if (errbuf) snprintf(errbuf, errlen, "init() returned %d", rc);
-            dlclose(h);
-            return -1;
-        }
-    }
-    p->active = 1;
-    m->plugins[m->count++] = p;
-    return 0;
-}
-
-static inline int mentalPluginUnload(MentalPluginManager *m, const char *name,
-                                     char *errbuf, size_t errlen)
-{
-    if (!m || !name) return -1;
-    for (int i = 0; i < m->count; i++) {
-        MentalPlugin *p = m->plugins[i];
-        if (!p || strcmp(p->name, name) != 0) continue;
-
-        if (p->vtable && p->vtable->shutdown)
-            p->vtable->shutdown(p);
-        if (p->handle) dlclose(p->handle);
-        free(p);
-
-        for (int j = i; j < m->count - 1; j++)
-            m->plugins[j] = m->plugins[j + 1];
-        m->plugins[--m->count] = NULL;
-        return 0;
-    }
-    if (errbuf) snprintf(errbuf, errlen, "plugin '%s' not loaded", name);
-    return -1;
-}
-
-static inline void mentalPluginTickAll(MentalPluginManager *m, double dt)
-{
-    if (!m) return;
-    for (int i = 0; i < m->count; i++) {
-        MentalPlugin *p = m->plugins[i];
-        if (p && p->active && p->vtable && p->vtable->tick)
-            p->vtable->tick(p, dt);
-    }
-}
-
-static inline int mentalPluginDispatchCommand(MentalPluginManager *m,
-                                              int argc, char **argv)
-{
-    if (!m || argc < 1) return 0;
-    for (int i = 0; i < m->count; i++) {
-        MentalPlugin *p = m->plugins[i];
-        if (p && p->active && p->vtable && p->vtable->on_command) {
-            if (p->vtable->on_command(p, argc, argv, &m->host))
-                return 1;
-        }
-    }
-    return 0;
-}
-
-static inline void mentalPluginNotifyPeer(MentalPluginManager *m,
-                                          const MentalP2PPeer *peer)
-{
-    if (!m || !peer) return;
-    for (int i = 0; i < m->count; i++) {
-        MentalPlugin *p = m->plugins[i];
-        if (p && p->active && p->vtable && p->vtable->on_p2p_peer)
-            p->vtable->on_p2p_peer(p, peer, &m->host);
-    }
-}
-
-static inline int mentalPluginLoadDir(MentalPluginManager *m, const char *dir,
-                                      char *errbuf, size_t errlen)
-{
-    DIR *d = opendir(dir);
-    if (!d) {
-        if (errbuf) snprintf(errbuf, errlen, "opendir: %s", strerror(errno));
-        return -1;
-    }
-    int loaded = 0;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        size_t len = strlen(e->d_name);
-        if (len < 3 || strcmp(e->d_name + len - 3, ".so") != 0) continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-        char err[256] = {0};
-        if (mentalPluginLoad(m, path, err, sizeof err) == 0) loaded++;
-        else fprintf(stderr, "[plugin] %s: %s\n", path, err);
-    }
-    closedir(d);
-    return loaded;
-}
+typedef struct MentalMapIface {
+    char           name[IFNAMSIZ];
+    char           ip[INET_ADDRSTRLEN];
+    struct in_addr addr;
+    struct in_addr mask;
+    int            prefix;
+    unsigned       flags;
+} MentalMapIface;
 
 /* ============================================================
  *  TUI core
@@ -909,6 +298,7 @@ static inline void mentalTuiPrintfWrap(MentalTui *tui, int fg, const char *text)
     }
 }
 
+/* ---- TUI sink -------------------------------------------------- */
 static inline void mental_sink_tui_line(MentalSink *self, int color, const char *text)
 {
     MentalTui *tui = (MentalTui *)self->ctx;
@@ -966,243 +356,14 @@ static inline void mentalTuiLeaveRaw(MentalTui *tui)
     }
 }
 
-/* ---- Plugin host op bodies (require TUI helpers above) ----------- */
-static inline void mental_plugin_host_register_command(MentalPluginHost *h,
-                                                       const char *name,
-                                                       const char *help,
-                                                       MTCommandFn fn,
-                                                       void *user)
+/* Set from the SIGWINCH handler; polled by the TUI loop. */
+static volatile sig_atomic_t g_mentalTuiResizePending = 0;
+
+static inline void mentalTuiHandleWinch(int sig)
 {
-    MentalTui *tui = (MentalTui *)h->ctx;
-    if (tui) mentalTuiRegister(tui, name, help, fn, user);
+    (void)sig;
+    g_mentalTuiResizePending = 1;
 }
-
-static inline void mental_plugin_host_print(MentalPluginHost *h, int color,
-                                            const char *fmt, ...)
-{
-    MentalTui *tui = (MentalTui *)h->ctx;
-    if (!tui) return;
-    char buf[MT_LINE_LEN];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    mentalTuiPrintfWrap(tui, color, buf);
-}
-
-static inline MentalP2PServer *mental_plugin_host_get_p2p(MentalPluginHost *h)
-{
-    MentalTui *tui = (MentalTui *)h->ctx;
-    return tui ? tui->p2p : NULL;
-}
-
-static inline void mental_plugin_host_mark_dirty(MentalPluginHost *h)
-{
-    MentalTui *tui = (MentalTui *)h->ctx;
-    if (tui) tui->dirty = 1;
-}
-
-/* Generic trampoline: lets a plugin register a TUI command that forwards
- * into its own on_command handler. `user` must be the MentalPlugin*. */
-static inline void mental_plugin_tui_trampoline(MentalTui *tui, int argc,
-                                                char **argv, void *user)
-{
-    MentalPlugin *p = (MentalPlugin *)user;
-    if (!tui || !tui->plugins || !p) return;
-    if (!p->active || !p->vtable || !p->vtable->on_command) return;
-    p->vtable->on_command(p, argc, argv, &tui->plugins->host);
-}
-
-/* ============================================================
- *  Auth: TUI login screen
- * ============================================================ */
-
-static inline void mentalTuiAuthReset(MentalTui *tui, int registering)
-{
-    if (!tui) return;
-    tui->auth.username[0] = '\0';
-    tui->auth.password[0] = '\0';
-    tui->auth.field       = 0;
-    tui->auth.have_error  = 0;
-    tui->auth.error[0]    = '\0';
-    tui->auth.is_registering = registering;
-    tui->auth.state = registering ? MENTAL_AUTH_STATE_REGISTER
-                                  : MENTAL_AUTH_STATE_LOGIN;
-}
-
-static inline void mentalTuiAuthDraw(MentalTui *tui)
-{
-    if (!tui) return;
-
-    char  *p   = tui->outbuf;
-    size_t rem = tui->outbuf_size;
-
-    p += snprintf(p, rem, MT_HOME MT_CLEAR);
-    rem = tui->outbuf_size - (size_t)(p - tui->outbuf);
-
-    int cx = tui->width / 2;
-    int cy = tui->height / 2 - 5;
-    if (cy < 1) cy = 1;
-
-    #define AUTH_LINE(row, color, text) do {                              \
-        int n = snprintf(p, rem, MT_ESC "%d;%dH" MT_ESC "%d;%dm" "%s",    \
-                         (row), (cx) - 24, color, MT_BG_DEFAULT, (text)); \
-        if (n > 0 && (size_t)n < rem) { p += n; rem -= (size_t)n; }       \
-    } while (0)
-
-    AUTH_LINE(cy,     MT_BCYAN,  "        Mental Framework - Sign in        ");
-    AUTH_LINE(cy + 1, MT_BBLACK, "                                           ");
-    AUTH_LINE(cy + 2, MT_BYELLOW, tui->auth.is_registering
-                                   ? "  [ REGISTER NEW USER ]"
-                                   : "  [ LOGIN ]");
-    AUTH_LINE(cy + 4, MT_WHITE,   "  Username:");
-    AUTH_LINE(cy + 5, MT_WHITE,   "  Password:");
-
-    {
-        char u[64], pp[64];
-        snprintf(u,  sizeof(u),  "  %s%s",
-                 tui->auth.username,
-                 (tui->auth.field == 0) ? "_" : "");
-        int n = snprintf(p, rem, MT_ESC "%d;%dH" MT_ESC "%d;%dm%s",
-                         cy + 4, cx - 10, MT_BGREEN, MT_BG_DEFAULT, u);
-        if (n > 0 && (size_t)n < rem) { p += n; rem -= (size_t)n; }
-
-        char stars[MAX_TUI_PASSWORD_LENGTH + 1];
-        size_t plen = strlen(tui->auth.password);
-        for (size_t i = 0; i < plen; i++) stars[i] = '*';
-        stars[plen] = '\0';
-        snprintf(pp, sizeof(pp), "  %s%s", stars,
-                 (tui->auth.field == 1) ? "_" : "");
-        n = snprintf(p, rem, MT_ESC "%d;%dH" MT_ESC "%d;%dm%s",
-                     cy + 5, cx - 10, MT_BGREEN, MT_BG_DEFAULT, pp);
-        if (n > 0 && (size_t)n < rem) { p += n; rem -= (size_t)n; }
-    }
-
-    if (tui->auth.have_error) {
-        int n = snprintf(p, rem, MT_ESC "%d;%dH" MT_ESC "%d;%dm  ! %s",
-                         cy + 7, cx - 22, MT_BRED, MT_BG_DEFAULT,
-                         tui->auth.error);
-        if (n > 0 && (size_t)n < rem) { p += n; rem -= (size_t)n; }
-    }
-
-    AUTH_LINE(cy + 9, MT_BBLACK,
-              "  Tab: next field   Enter: submit   Esc: quit   ");
-
-    if (tui->auth.state == MENTAL_AUTH_STATE_LOGIN) {
-        AUTH_LINE(cy + 10, MT_BBLACK, "  (no account? press 'n' to register)");
-    } else {
-        AUTH_LINE(cy + 10, MT_BBLACK, "  (press 'b' to go back to login)");
-    }
-
-    #undef AUTH_LINE
-
-    {
-        const char *val = (tui->auth.field == 0) ? tui->auth.username
-                                                 : tui->auth.password;
-        int col = cx - 10 + 2 + (int)strlen(val);
-        int n = snprintf(p, rem, MT_ESC "%d;%dH" MT_SHOW_CURSOR,
-                         cy + 4 + tui->auth.field, col);
-        if (n > 0 && (size_t)n < rem) { p += n; rem -= (size_t)n; }
-    }
-
-    fwrite(tui->outbuf, 1, (size_t)(p - tui->outbuf), stdout);
-    fflush(stdout);
-}
-
-static inline void mentalTuiAuthSubmit(MentalTui *tui)
-{
-    if (!tui || !tui->auth.store) return;
-
-    if (!tui->auth.username[0] || !tui->auth.password[0]) {
-        snprintf(tui->auth.error, sizeof(tui->auth.error),
-                 "username and password must not be empty");
-        tui->auth.have_error = 1;
-        return;
-    }
-
-    MentalAuthResult r;
-    if (tui->auth.state == MENTAL_AUTH_STATE_REGISTER) {
-        r = mental_auth_register(tui->auth.store,
-                                 tui->auth.username, tui->auth.password);
-        if (r == MENTAL_AUTH_OK) {
-            tui->authenticated = 1;
-            tui->auth.state    = MENTAL_AUTH_STATE_DONE;
-            return;
-        }
-    } else {
-        r = mental_auth_login(tui->auth.store,
-                              tui->auth.username, tui->auth.password);
-        if (r == MENTAL_AUTH_OK) {
-            tui->authenticated = 1;
-            tui->auth.state    = MENTAL_AUTH_STATE_DONE;
-            return;
-        }
-        tui->auth.attempts++;
-        if (tui->auth.attempts >= MENTAL_AUTH_MAX_ATTEMPTS) {
-            snprintf(tui->auth.error, sizeof(tui->auth.error),
-                     "too many attempts - exiting");
-            tui->auth.have_error = 1;
-            tui->running = 0;
-            return;
-        }
-    }
-
-    snprintf(tui->auth.error, sizeof(tui->auth.error),
-             "%s", mental_auth_result_str(r));
-    tui->auth.have_error = 1;
-    tui->auth.password[0] = '\0';
-    tui->auth.field = 1;
-}
-
-static inline void mentalTuiAuthHandleByte(MentalTui *tui, unsigned char c)
-{
-    if (!tui) return;
-
-    if (c == 27) { tui->running = 0; return; }
-    if (c == 3)  { tui->running = 0; return; }
-
-    if (c == '\t') {
-        tui->auth.field ^= 1;
-        return;
-    }
-    if (c == '\r' || c == '\n') {
-        if (tui->auth.field == 0) { tui->auth.field = 1; }
-        else                       { mentalTuiAuthSubmit(tui); }
-        return;
-    }
-    if (c == 'n' && tui->auth.state == MENTAL_AUTH_STATE_LOGIN
-        && tui->auth.field == 0
-        && tui->auth.username[0] == '\0') {
-        mentalTuiAuthReset(tui, 1);
-        return;
-    }
-    if (c == 'b' && tui->auth.state == MENTAL_AUTH_STATE_REGISTER
-        && tui->auth.field == 0
-        && tui->auth.username[0] == '\0') {
-        mentalTuiAuthReset(tui, 0);
-        return;
-    }
-
-    if (c == 127 || c == 8) {
-        char *buf = (tui->auth.field == 0) ? tui->auth.username
-                                           : tui->auth.password;
-        size_t l = strlen(buf);
-        if (l > 0) buf[l - 1] = '\0';
-        return;
-    }
-    if (c >= 32 && c < 127) {
-        char *buf  = (tui->auth.field == 0) ? tui->auth.username
-                                            : tui->auth.password;
-        size_t max = (tui->auth.field == 0) ? MAX_TUI_USERNAME_LENGTH
-                                            : MAX_TUI_PASSWORD_LENGTH;
-        size_t l = strlen(buf);
-        if (l < max) { buf[l] = (char)c; buf[l + 1] = '\0'; }
-    }
-}
-
-/* ============================================================
- *  TUI creation / destruction
- * ============================================================ */
 
 static inline MentalTui *mentalTuiCreate(int width, int height)
 {
@@ -1224,23 +385,9 @@ static inline MentalTui *mentalTuiCreate(int width, int height)
     tui->running = 1;
     tui->dirty   = 1;
     mentalTuiEnterRaw(tui);
+    signal(SIGWINCH, mentalTuiHandleWinch);
     fputs(MT_HIDE_CURSOR MT_CLEAR MT_HOME, stdout);
     fflush(stdout);
-
-    tui->auth.store = (MentalAuthStore *)calloc(1, sizeof(MentalAuthStore));
-    if (!tui->auth.store) {
-        mentalTuiLeaveRaw(tui);
-        free(tui->outbuf); free(tui->lines); free(tui);
-        return NULL;
-    }
-    if (mental_auth_store_init(tui->auth.store, NULL) != MENTAL_AUTH_OK) {
-        mentalTuiPrintf(tui, MT_BRED,
-                        "[auth] could not initialize credential store");
-    }
-    mentalTuiAuthReset(tui, 0);
-    tui->authenticated = 0;
-
-    tui->plugins = mentalPluginManagerCreate(tui);
 
     mentalTuiPrintf(tui, MT_BCYAN, "Mental Framework TUI ready. Type 'help'.");
     return tui;
@@ -1250,21 +397,33 @@ static inline void mentalTuiDestroy(MentalTui *tui)
 {
     if (!tui) return;
 
-    if (tui->plugins) {
-        mentalPluginManagerDestroy(tui->plugins);
-        tui->plugins = NULL;
-    }
-
+    /* Stop children deterministically: SIGTERM, a short grace period, then
+     * SIGKILL, and always reap so no zombies are left behind. */
     for (int i = 0; i < MT_MAX_PROCS; i++) {
-        if (tui->procs[i].used) {
-            kill(tui->procs[i].pid, SIGTERM);
-            if (tui->procs[i].fd >= 0) close(tui->procs[i].fd);
+        MTProc *p = &tui->procs[i];
+        if (!p->used) continue;
+
+        pid_t pid = p->pid;
+        if (p->fd >= 0) { close(p->fd); p->fd = -1; }
+        p->used = 0;
+        if (pid <= 0) continue;
+
+        kill(pid, SIGTERM);
+
+        int reaped = 0;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            pid_t r = waitpid(pid, NULL, WNOHANG);
+            if (r == pid || (r < 0 && errno == ECHILD)) { reaped = 1; break; }
+            poll(NULL, 0, 10);
+        }
+        if (!reaped) {
+            kill(pid, SIGKILL);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         }
     }
 
-    if (tui->auth.store) { free(tui->auth.store); tui->auth.store = NULL; }
-
     mentalTuiLeaveRaw(tui);
+    signal(SIGWINCH, SIG_DFL);
     fputs(MT_SHOW_CURSOR MT_RESET MT_CLEAR MT_HOME, stdout);
     fflush(stdout);
 
@@ -1280,17 +439,13 @@ static inline void mentalTuiDestroy(MentalTui *tui)
 static inline void mentalP2PLog(MentalP2PServer *srv, int color,
                                 const char *fmt, ...)
 {
+    if (!srv || !srv->log_sink) return;
     char buf[MT_LINE_LEN];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-
-    if (srv && srv->log_sink) {
-        mental_sink_printf(srv->log_sink, color, "%s", buf);
-    } else {
-        fprintf(stderr, "%s\n", buf);
-    }
+    mental_sink_printf(srv->log_sink, color, "%s", buf);
 }
 
 static inline void mentalP2PSetLogSink(MentalP2PServer *srv, MentalSink *sink)
@@ -1304,7 +459,6 @@ static inline MentalP2PServer *mentalP2PCreate(void)
     if (!srv) return NULL;
 
     srv->discovery_fd = -1;
-    srv->tui_owner    = NULL;
 
     srv->discovery_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (srv->discovery_fd < 0) {
@@ -1312,6 +466,7 @@ static inline MentalP2PServer *mentalP2PCreate(void)
         free(srv);
         return NULL;
     }
+    fcntl(srv->discovery_fd, F_SETFD, FD_CLOEXEC);
 
     int enable = 1;
     if (setsockopt(srv->discovery_fd, SOL_SOCKET, SO_BROADCAST,
@@ -1494,19 +649,15 @@ static inline int mentalP2PPoll(MentalP2PServer *srv)
 
     mentalP2PLog(srv, MT_BGREEN, "[p2p] discovered peer %s:%u (%d total)",
                  p->ip, p->port, srv->peer_count);
-
-    if (srv->tui_owner && srv->tui_owner->plugins)
-        mentalPluginNotifyPeer(srv->tui_owner->plugins, p);
-
     return 1;
 }
 
+/* ---- TUI ↔ P2P glue -------------------------------------------- */
 static inline void mentalTuiBindP2PSink(MentalTui *tui, MentalP2PServer *srv)
 {
     if (!tui || !srv) return;
     tui->p2p_sink       = mental_sink_tui(tui);
     tui->p2p_sink_ready = 1;
-    srv->tui_owner      = tui;
     mentalP2PSetLogSink(srv, &tui->p2p_sink);
 }
 
@@ -1550,6 +701,7 @@ static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
     }
 
     close(pipefd[1]);
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     int flags = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
 
@@ -1559,6 +711,17 @@ static inline int mentalTuiSpawnShell(MentalTui *tui, const char *cmd)
     tui->procs[slot].eof_seen = 0;
     mentalTuiPrintf(tui, MT_BBLACK, "$ %s", cmd);
     return slot;
+}
+
+/* Emit one complete line accumulated from a child process pipe. */
+static inline void mentalTuiProcFlushLine(MentalTui *tui, MTProc *p)
+{
+    if (!tui || !p) return;
+    p->linebuf[p->line_len] = '\0';
+    if (p->line_len > 0 && p->linebuf[p->line_len - 1] == '\r')
+        p->linebuf[p->line_len - 1] = '\0';
+    mentalTuiPrintf(tui, MT_WHITE, "%s", p->linebuf);
+    p->line_len = 0;
 }
 
 static inline void mentalTuiDrainProcs(MentalTui *tui)
@@ -1574,18 +737,33 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
             ssize_t n = read(p->fd, buf, sizeof(buf) - 1);
 
             if (n > 0) {
-                buf[n] = '\0';
-                char *save = NULL;
-                for (char *line = strtok_r(buf, "\n", &save); line;
-                     line = strtok_r(NULL, "\n", &save)) {
-                    mentalTuiPrintf(tui, MT_WHITE, "%s", line);
+                for (ssize_t k = 0; k < n; k++) {
+                    char ch = buf[k];
+                    if (ch == '\n') {
+                        mentalTuiProcFlushLine(tui, p);
+                    } else if (p->line_len < MT_LINE_LEN - 1) {
+                        p->linebuf[p->line_len++] = ch;
+                    } else {
+                        /* Very long line: flush a full buffer, keep going. */
+                        mentalTuiProcFlushLine(tui, p);
+                        p->linebuf[p->line_len++] = ch;
+                    }
                 }
                 continue;
             }
-            if (n == 0) { close(p->fd); p->fd = -1; p->eof_seen = 1; break; }
+            if (n == 0) {
+                if (p->line_len > 0)              /* no trailing newline */
+                    mentalTuiProcFlushLine(tui, p);
+                close(p->fd);
+                p->fd = -1;
+                p->eof_seen = 1;
+                break;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
 
+            if (p->line_len > 0)
+                mentalTuiProcFlushLine(tui, p);
             close(p->fd);
             p->fd = -1;
             p->eof_seen = 1;
@@ -1608,6 +786,39 @@ static inline void mentalTuiDrainProcs(MentalTui *tui)
     }
 }
 
+/* Append formatted text to a bounded buffer. On truncation the cursor stops
+ * at the terminating NUL and *pRem becomes 0, so callers can never move past
+ * the end of the buffer (snprintf returns the would-be length, not the number
+ * of bytes actually written). Returns the number of bytes appended, or -1. */
+static inline int mental_buf_append(char **pp, size_t *pRem,
+                                    const char *fmt, ...)
+{
+    if (!pp || !pRem || !*pp || !fmt) return -1;
+
+    size_t rem = *pRem;
+    if (rem == 0) return -1;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*pp, rem, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        (*pp)[0] = '\0';
+        *pRem = 0;
+        return -1;
+    }
+    if ((size_t)n >= rem) {
+        *pp += rem - 1;   /* last byte written is the NUL terminator */
+        *pRem = 0;
+        return -1;
+    }
+
+    *pp += (size_t)n;
+    *pRem -= (size_t)n;
+    return n;
+}
+
 /* ============================================================
  *  Frame rendering
  * ============================================================ */
@@ -1621,8 +832,7 @@ static inline void mentalTuiFlush(MentalTui *tui)
     int output_rows = tui->height - 1;
     if (output_rows < 1) output_rows = 1;
 
-    p += snprintf(p, rem, MT_HOME);
-    rem = tui->outbuf_size - (size_t)(p - tui->outbuf);
+    mental_buf_append(&p, &rem, MT_HOME);
 
     int last_fg = -1, last_bg = -1;
 
@@ -1644,19 +854,18 @@ static inline void mentalTuiFlush(MentalTui *tui)
             }
 
             if (fg != last_fg || bg != last_bg) {
-                int n = snprintf(p, rem, MT_ESC "%d;%dm", fg, bg);
-                if (n > 0) { p += n; rem -= (size_t)n; }
+                mental_buf_append(&p, &rem, MT_ESC "%d;%dm", fg, bg);
                 last_fg = fg; last_bg = bg;
             }
-            if (rem < 2) break;
+            if (rem < 2) { rem = 0; break; }
             *p++ = ch; rem--;
         }
-        if (rem < 2) break;
+        if (rem < 2) { rem = 0; break; }
         *p++ = '\r'; *p++ = '\n'; rem -= 2;
     }
 
-    p += snprintf(p, rem, MT_RESET MT_ESC "%d;%dm> ", MT_BBLACK, MT_BG_DEFAULT);
-    rem = tui->outbuf_size - (size_t)(p - tui->outbuf);
+    mental_buf_append(&p, &rem, MT_RESET MT_ESC "%d;%dm> ",
+                      MT_BBLACK, MT_BG_DEFAULT);
 
     for (int i = 0; i < tui->input_len && rem > 2; i++) {
         *p++ = tui->input[i];
@@ -1673,9 +882,8 @@ static inline void mentalTuiFlush(MentalTui *tui)
         int cx = 2 + tui->input_cursor;
         if (cx < 1) cx = 1;
         if (cx > tui->width) cx = tui->width;
-        int n = snprintf(p, rem, MT_ESC "%d;%dH" MT_SHOW_CURSOR,
-                         tui->height, cx);
-        if (n > 0) { p += n; rem -= (size_t)n; }
+        mental_buf_append(&p, &rem, MT_ESC "%d;%dH" MT_SHOW_CURSOR,
+                          tui->height, cx);
     }
 
     fwrite(tui->outbuf, 1, (size_t)(p - tui->outbuf), stdout);
@@ -1690,6 +898,18 @@ static inline void mentalTuiHandleByte(MentalTui *tui, unsigned char c)
     if (!tui) return;
     tui->dirty = 1;
 
+    /* Swallow ANSI/CSI sequences (arrows, Home, End, function keys) so their
+     * trailing bytes never leak into the command line as plain text. */
+    if (tui->esc_state) {
+        if (c == 27) { tui->esc_state = 1; return; }
+        if (tui->esc_state == 1) {
+            tui->esc_state = (c == '[' || c == 'O') ? 2 : 0;
+            return;
+        }
+        if (c >= 0x40 && c <= 0x7e) tui->esc_state = 0;   /* final byte */
+        return;
+    }
+
     if (c == '\r' || c == '\n') { mentalTuiSubmitInput(tui); return; }
     if (c == 127 || c == 8) {
         if (tui->input_cursor > 0) {
@@ -1702,7 +922,7 @@ static inline void mentalTuiHandleByte(MentalTui *tui, unsigned char c)
         return;
     }
     if (c == 3) { tui->running = 0; return; }
-    if (c == 27) return;
+    if (c == 27) { tui->esc_state = 1; return; }
     if (c >= 32 && c < 127) {
         if (tui->input_len < MT_INPUT_LEN - 1) {
             memmove(&tui->input[tui->input_cursor + 1],
@@ -1720,6 +940,12 @@ static inline void mentalTuiSubmitInput(MentalTui *tui)
     if (!tui || tui->input_len == 0) return;
 
     tui->input[tui->input_len] = '\0';
+
+    /* The argv parser below modifies tui->input in place. Keep an intact
+     * copy for the shell: otherwise `ls -la /tmp` would run as plain `ls`. */
+    char raw[MT_INPUT_LEN];
+    memcpy(raw, tui->input, (size_t)tui->input_len + 1);
+
     mentalTuiPrintf(tui, MT_BBLACK, "> %s", tui->input);
 
     char *argv[32];
@@ -1743,24 +969,14 @@ static inline void mentalTuiSubmitInput(MentalTui *tui)
 
     if (argc > 0) {
         int handled = 0;
-
-        /* 1) Plugins get first crack via on_command. */
-        if (tui->plugins && mentalPluginDispatchCommand(tui->plugins, argc, argv))
-            handled = 1;
-
-        /* 2) Built-in / plugin-registered commands. */
-        if (!handled) {
-            for (int i = 0; i < tui->cmd_count; i++) {
-                if (strcmp(tui->cmds[i].name, argv[0]) == 0) {
-                    tui->cmds[i].fn(tui, argc, argv, tui->cmds[i].user);
-                    handled = 1;
-                    break;
-                }
+        for (int i = 0; i < tui->cmd_count; i++) {
+            if (strcmp(tui->cmds[i].name, argv[0]) == 0) {
+                tui->cmds[i].fn(tui, argc, argv, tui->cmds[i].user);
+                handled = 1;
+                break;
             }
         }
-
-        /* 3) Shell fallback. */
-        if (!handled) mentalTuiSpawnShell(tui, tui->input);
+        if (!handled) mentalTuiSpawnShell(tui, raw);
     }
 
     tui->input_len    = 0;
@@ -1773,12 +989,27 @@ static inline void mentalTuiRun(MentalTui *tui)
 {
     if (!tui) return;
 
-    struct timespec last_tick;
-    clock_gettime(CLOCK_MONOTONIC, &last_tick);
-
     struct pollfd fds[MT_MAX_PROCS + 2];
     while (tui->running) {
-        if (tui->authenticated) mentalTuiDrainProcs(tui);
+        if (g_mentalTuiResizePending) {
+            g_mentalTuiResizePending = 0;
+
+            int w = 0, h = 0;
+            mentalTuiTerminalSize(&w, &h);
+            if (w != tui->width || h != tui->height) {
+                size_t need = (size_t)w * (size_t)h * 24 + 256;
+                char *pNew = realloc(tui->outbuf, need);
+                if (pNew) {
+                    tui->outbuf      = pNew;
+                    tui->outbuf_size = need;
+                    tui->width       = w;
+                    tui->height      = h;
+                    tui->dirty       = 1;
+                }
+            }
+        }
+
+        mentalTuiDrainProcs(tui);
 
         int nfds = 1;
         fds[0].fd     = STDIN_FILENO;
@@ -1786,7 +1017,7 @@ static inline void mentalTuiRun(MentalTui *tui)
         fds[0].revents = 0;
 
         for (int i = 0; i < MT_MAX_PROCS; i++) {
-            if (tui->authenticated && tui->procs[i].used && tui->procs[i].fd >= 0) {
+            if (tui->procs[i].used && tui->procs[i].fd >= 0) {
                 fds[nfds].fd      = tui->procs[i].fd;
                 fds[nfds].events  = POLLIN;
                 fds[nfds].revents = 0;
@@ -1811,12 +1042,7 @@ static inline void mentalTuiRun(MentalTui *tui)
                 unsigned char buf[64];
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if (n <= 0) break;
-                for (ssize_t i = 0; i < n; i++) {
-                    if (!tui->authenticated)
-                        mentalTuiAuthHandleByte(tui, buf[i]);
-                    else
-                        mentalTuiHandleByte(tui, buf[i]);
-                }
+                for (ssize_t i = 0; i < n; i++) mentalTuiHandleByte(tui, buf[i]);
                 if (n < (ssize_t)sizeof(buf)) break;
             }
         }
@@ -1831,37 +1057,106 @@ static inline void mentalTuiRun(MentalTui *tui)
             }
         }
 
-        /* Tick plugins each frame. */
-        if (tui->plugins) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            double dt = (double)(now.tv_sec - last_tick.tv_sec)
-                      + (double)(now.tv_nsec - last_tick.tv_nsec) / 1e9;
-            last_tick = now;
-            mentalPluginTickAll(tui->plugins, dt);
-        }
-
-        if (!tui->authenticated) {
-            mentalTuiAuthDraw(tui);
-        } else if (tui->dirty) {
-            mentalTuiFlush(tui);
-        }
+        if (tui->dirty) mentalTuiFlush(tui);
     }
 }
 
 /* ============================================================
  *  System / network info  (sink-based)
  * ============================================================ */
-static inline int __mental_sysctl_int(const char *pName, int *pOut)
+static inline int mental_detail_sysctl_int(const char *pName, int *pOut)
 {
+#if defined(__linux__)
+    if (!pName || !pOut) return -1;
+
+    if (strcmp(pName, "hw.ncpu") == 0) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) return -1;
+        *pOut = (int)n;
+        return 0;
+    }
+    if (strcmp(pName, "hw.pagesize") == 0) {
+        long n = sysconf(_SC_PAGESIZE);
+        if (n < 1) return -1;
+        *pOut = (int)n;
+        return 0;
+    }
+    return -1;
+#else
     size_t len = sizeof(*pOut);
     return sysctlbyname(pName, pOut, &len, NULL, 0);
+#endif
 }
 
-static inline int __mental_sysctl_str(const char *pName, char *pBuf, size_t buflen)
+static inline int mental_detail_sysctl_str(const char *pName, char *pBuf, size_t buflen)
 {
+#if defined(__linux__)
+    if (!pName || !pBuf || buflen == 0) return -1;
+
+    if (strcmp(pName, "hw.machine") == 0) {
+        struct utsname u;
+        if (uname(&u) != 0) return -1;
+        snprintf(pBuf, buflen, "%s", u.machine);
+        return 0;
+    }
+    if (strcmp(pName, "hw.model") == 0) {
+        FILE *fp = fopen("/proc/cpuinfo", "r");
+        if (!fp) return -1;
+
+        char line[512];
+        int rc = -1;
+        while (fgets(line, sizeof line, fp)) {
+            if (strncmp(line, "model name", 10) != 0) continue;
+
+            char *colon = strchr(line, ':');
+            if (!colon) continue;
+
+            char *value = colon + 1;
+            while (*value == ' ' || *value == '\t') value++;
+
+            size_t len = strlen(value);
+            while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r'))
+                value[--len] = '\0';
+
+            snprintf(pBuf, buflen, "%s", value);
+            rc = 0;
+            break;
+        }
+        fclose(fp);
+        return rc;
+    }
+    return -1;
+#else
     size_t len = buflen;
     return sysctlbyname(pName, pBuf, &len, NULL, 0);
+#endif
+}
+
+/* 64-bit physical memory. On macOS hw.physmem is not reliably 64-bit,
+ * so hw.memsize is preferred there. */
+static inline int mental_detail_sysctl_u64(const char *pName, unsigned long long *pOut)
+{
+    if (!pName || !pOut) return -1;
+
+#if defined(__linux__)
+    if (strcmp(pName, "hw.physmem") != 0) return -1;
+
+    struct sysinfo si;
+    if (sysinfo(&si) != 0) return -1;
+    *pOut = (unsigned long long)si.totalram * (unsigned long long)si.mem_unit;
+    return 0;
+#elif defined(__APPLE__)
+    if (strcmp(pName, "hw.physmem") == 0) pName = "hw.memsize";
+
+    size_t len = sizeof(*pOut);
+    return sysctlbyname(pName, pOut, &len, NULL, 0);
+#else
+    unsigned long value = 0;
+    size_t len = sizeof(value);
+    if (sysctlbyname(pName, &value, &len, NULL, 0) != 0) return -1;
+    *pOut = (unsigned long long)value;
+    return 0;
+#endif
 }
 
 static inline void mental_print_network_info_sink(MentalSink *s)
@@ -1900,12 +1195,13 @@ static inline void mental_print_network_info_sink(MentalSink *s)
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
         char flags[128] = {0};
-        size_t off = 0;
-        if (ifa->ifa_flags & IFF_UP)        off += snprintf(flags+off, sizeof flags - off, "UP ");
-        if (ifa->ifa_flags & IFF_RUNNING)   off += snprintf(flags+off, sizeof flags - off, "RUNNING ");
-        if (ifa->ifa_flags & IFF_LOOPBACK)  off += snprintf(flags+off, sizeof flags - off, "LOOPBACK ");
-        if (ifa->ifa_flags & IFF_BROADCAST) off += snprintf(flags+off, sizeof flags - off, "BROADCAST ");
-        if (ifa->ifa_flags & IFF_MULTICAST) off += snprintf(flags+off, sizeof flags - off, "MULTICAST ");
+        char *fp = flags;
+        size_t frem = sizeof flags;
+        if (ifa->ifa_flags & IFF_UP)        mental_buf_append(&fp, &frem, "UP ");
+        if (ifa->ifa_flags & IFF_RUNNING)   mental_buf_append(&fp, &frem, "RUNNING ");
+        if (ifa->ifa_flags & IFF_LOOPBACK)  mental_buf_append(&fp, &frem, "LOOPBACK ");
+        if (ifa->ifa_flags & IFF_BROADCAST) mental_buf_append(&fp, &frem, "BROADCAST ");
+        if (ifa->ifa_flags & IFF_MULTICAST) mental_buf_append(&fp, &frem, "MULTICAST ");
         mental_sink_printf(s, MT_WHITE, "  %-10s flags: 0x%x (%s)",
                            ifa->ifa_name, ifa->ifa_flags, flags);
     }
@@ -1931,24 +1227,24 @@ static inline void mental_print_system_info_sink(MentalSink *s)
     mental_sink_printf(s, MT_BYELLOW, "---- Hardware (sysctl) ----");
 
     int ncpu = 0;
-    if (__mental_sysctl_int("hw.ncpu", &ncpu) == 0)
+    if (mental_detail_sysctl_int("hw.ncpu", &ncpu) == 0)
         mental_sink_printf(s, MT_WHITE, "  hw.ncpu        : %d", ncpu);
 
-    int physmem = 0;
-    if (__mental_sysctl_int("hw.physmem", &physmem) == 0)
-        mental_sink_printf(s, MT_WHITE, "  hw.physmem     : %d bytes (%.2f GiB)",
-                           physmem, physmem / (1024.0 * 1024.0 * 1024.0));
+    unsigned long long physmem = 0;
+    if (mental_detail_sysctl_u64("hw.physmem", &physmem) == 0)
+        mental_sink_printf(s, MT_WHITE, "  hw.physmem     : %llu bytes (%.2f GiB)",
+                           physmem, (double)physmem / (1024.0 * 1024.0 * 1024.0));
 
     int pagesize = 0;
-    if (__mental_sysctl_int("hw.pagesize", &pagesize) == 0)
+    if (mental_detail_sysctl_int("hw.pagesize", &pagesize) == 0)
         mental_sink_printf(s, MT_WHITE, "  hw.pagesize    : %d bytes", pagesize);
 
     char model[256] = {0};
-    if (__mental_sysctl_str("hw.model", model, sizeof model) == 0)
+    if (mental_detail_sysctl_str("hw.model", model, sizeof model) == 0)
         mental_sink_printf(s, MT_WHITE, "  hw.model       : %s", model);
 
     char machine[256] = {0};
-    if (__mental_sysctl_str("hw.machine", machine, sizeof machine) == 0)
+    if (mental_detail_sysctl_str("hw.machine", machine, sizeof machine) == 0)
         mental_sink_printf(s, MT_WHITE, "  hw.machine     : %s", machine);
 
     mental_print_network_info_sink(s);
@@ -1963,6 +1259,545 @@ static inline void mental_print_system_info(void)
 {
     MentalSink s = mental_sink_stdout();
     mental_print_system_info_sink(&s);
+}
+
+/* ============================================================
+ *  Network map (interfaces + p2p peers + arp)
+ * ============================================================ */
+
+static inline void mentalMapSetString(char *pDst, size_t cap, const char *pSrc)
+{
+    if (!pDst || cap == 0) return;
+    if (!pSrc) { pDst[0] = '\0'; return; }
+    strncpy(pDst, pSrc, cap - 1);
+    pDst[cap - 1] = '\0';
+}
+
+static inline void mentalMapUpsert(MentalMapDevice *pOut, int *pCount, int cap,
+                                   const char *pIp, const char *pMac,
+                                   const char *pIfname, unsigned flags,
+                                   unsigned short port, int *pDropped)
+{
+    if (!pOut || !pCount || !pIp || pIp[0] == '\0' || cap <= 0) return;
+
+    for (int i = 0; i < *pCount; i++) {
+        if (strcmp(pOut[i].ip, pIp) != 0) continue;
+
+        pOut[i].flags |= flags;
+        if (pMac && pMac[0] && pOut[i].mac[0] == '\0')
+            mentalMapSetString(pOut[i].mac, sizeof(pOut[i].mac), pMac);
+        if (pIfname && pIfname[0] && pOut[i].ifname[0] == '\0')
+            mentalMapSetString(pOut[i].ifname, sizeof(pOut[i].ifname), pIfname);
+        if (flags & MENTAL_MAP_PEER) pOut[i].port = port;
+        return;
+    }
+
+    if (*pCount >= cap) {
+        if (pDropped) (*pDropped)++;
+        return;
+    }
+
+    MentalMapDevice *pDev = &pOut[(*pCount)++];
+    memset(pDev, 0, sizeof(*pDev));
+    mentalMapSetString(pDev->ip, sizeof(pDev->ip), pIp);
+    mentalMapSetString(pDev->mac, sizeof(pDev->mac), pMac);
+    mentalMapSetString(pDev->ifname, sizeof(pDev->ifname), pIfname);
+    pDev->flags = flags;
+    pDev->port  = port;
+}
+
+/* Parse /proc/net/arp (Linux). Returns the number of parsed rows or -1. */
+static inline int mentalMapParseArpStream(FILE *pFile, MentalMapDevice *pOut,
+                                          int cap, int *pCount, int *pDropped)
+{
+    if (!pFile || !pOut || !pCount) return -1;
+
+    char line[256];
+    if (!fgets(line, sizeof line, pFile)) return 0;    /* header */
+
+    int parsed = 0;
+    while (fgets(line, sizeof line, pFile)) {
+        char ip[INET_ADDRSTRLEN] = {0};
+        char mac[32] = {0};
+        char mask[32] = {0};
+        char ifname[IFNAMSIZ] = {0};
+        unsigned int hwtype = 0;
+        unsigned int flags = 0;
+
+        int fields = sscanf(line, "%15s %x %x %31s %31s %15s",
+                            ip, &hwtype, &flags, mac, mask, ifname);
+        if (fields < 4) continue;
+        if ((flags & 0x2u) == 0) continue;             /* ATF_COM */
+        if (strcmp(mac, "00:00:00:00:00:00") == 0) continue;
+
+        struct in_addr addr;
+        if (inet_pton(AF_INET, ip, &addr) != 1) continue;
+
+        if (fields < 6) ifname[0] = '\0';
+        mentalMapUpsert(pOut, pCount, cap, ip, mac, ifname,
+                        MENTAL_MAP_ARP, 0, pDropped);
+        parsed++;
+    }
+    return parsed;
+}
+
+#if defined(__FreeBSD__) || defined(__APPLE__)
+
+#ifndef MENTAL_MAP_ROUNDUP
+#define MENTAL_MAP_ROUNDUP(a) \
+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+#endif
+
+/* Parse the NET_RT_FLAGS routing-table buffer (FreeBSD/macOS). */
+static inline int mentalMapParseRtBuffer(const void *pBuf, size_t len,
+                                         MentalMapDevice *pOut, int cap,
+                                         int *pCount, int *pDropped)
+{
+    if (!pBuf || !pOut || !pCount) return -1;
+
+    const char *p    = (const char *)pBuf;
+    const char *end  = p + len;
+    int parsed = 0;
+
+    while ((size_t)(end - p) >= sizeof(struct rt_msghdr)) {
+        /* Copy the header: the buffer may not be aligned for the struct. */
+        struct rt_msghdr rtm;
+        memcpy(&rtm, p, sizeof rtm);
+        if (rtm.rtm_msglen < sizeof(struct rt_msghdr) ||
+            (size_t)(end - p) < (size_t)rtm.rtm_msglen) break;
+
+        if ((rtm.rtm_flags & RTF_LLINFO) &&
+            (rtm.rtm_addrs & RTA_DST) &&
+            (rtm.rtm_addrs & RTA_GATEWAY)) {
+
+            const char *pAddr    = p + sizeof(struct rt_msghdr);
+            const char *pAddrEnd = p + rtm.rtm_msglen;
+            const char *pDst     = NULL;
+            const char *pGw      = NULL;
+
+            for (int bit = 1; bit <= RTA_GATEWAY; bit <<= 1) {
+                if ((rtm.rtm_addrs & bit) == 0) continue;
+                if ((size_t)(pAddrEnd - pAddr) < sizeof(struct sockaddr)) break;
+
+                /* On BSD sockaddr starts with a one-byte length field. */
+                unsigned char sa_len = 0;
+                memcpy(&sa_len, pAddr, 1);
+                if (sa_len == 0) break;
+
+                size_t step = MENTAL_MAP_ROUNDUP(sa_len);
+                if (step > (size_t)(pAddrEnd - pAddr)) break;
+
+                if (bit == RTA_DST)     pDst = pAddr;
+                if (bit == RTA_GATEWAY) pGw  = pAddr;
+                pAddr += step;
+            }
+
+            if (pDst && pGw) {
+                unsigned char dst_len = 0, gw_len = 0;
+                memcpy(&dst_len, pDst, 1);
+                memcpy(&gw_len,  pGw,  1);
+
+                struct sockaddr_in sin;
+                memset(&sin, 0, sizeof sin);
+                if ((size_t)dst_len >= sizeof(struct sockaddr_in))
+                    memcpy(&sin, pDst, sizeof sin);
+
+                size_t sdl_prefix = offsetof(struct sockaddr_dl, sdl_data);
+                struct sockaddr_dl sdl;
+                memset(&sdl, 0, sizeof sdl);
+                if ((size_t)gw_len >= sdl_prefix)
+                    memcpy(&sdl, pGw, sdl_prefix);
+
+                if (sin.sin_family == AF_INET && sdl.sdl_family == AF_LINK) {
+                    size_t name_off = sdl_prefix;
+                    size_t name_len = (size_t)sdl.sdl_nlen;
+                    size_t addr_len = (size_t)sdl.sdl_alen;
+
+                    /* The link-layer data must fit inside the sockaddr. */
+                    if (name_off + name_len + addr_len <= (size_t)gw_len) {
+                        char ip[INET_ADDRSTRLEN];
+                        if (inet_ntop(AF_INET, &sin.sin_addr, ip, sizeof ip)) {
+                            char mac[18] = {0};
+                            if (addr_len == 6) {
+                                const unsigned char *pLl =
+                                    (const unsigned char *)(pGw + name_off + name_len);
+                                snprintf(mac, sizeof mac,
+                                         "%02x:%02x:%02x:%02x:%02x:%02x",
+                                         pLl[0], pLl[1], pLl[2],
+                                         pLl[3], pLl[4], pLl[5]);
+                            }
+
+                            char ifname[IFNAMSIZ] = {0};
+                            if (name_len > 0) {
+                                size_t n = name_len;
+                                if (n > sizeof(ifname) - 1) n = sizeof(ifname) - 1;
+                                memcpy(ifname, pGw + name_off, n);
+                                ifname[n] = '\0';
+                            }
+
+                            mentalMapUpsert(pOut, pCount, cap, ip, mac, ifname,
+                                            MENTAL_MAP_ARP, 0, pDropped);
+                            parsed++;
+                        }
+                    }
+                }
+            }
+        }
+        p += rtm.rtm_msglen;
+    }
+    return parsed;
+}
+
+#endif /* __FreeBSD__ || __APPLE__ */
+
+static inline int mentalMapCollectArp(MentalMapDevice *pOut, int cap,
+                                      int *pCount, int *pDropped)
+{
+#if defined(__linux__)
+    FILE *pFile = fopen("/proc/net/arp", "r");
+    if (!pFile) return -1;
+
+    int rc = mentalMapParseArpStream(pFile, pOut, cap, pCount, pDropped);
+    fclose(pFile);
+    return rc;
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+    int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO };
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        size_t need = 0;
+        if (sysctl(mib, 6, NULL, &need, NULL, 0) != 0) return -1;
+        if (need == 0) return 0;
+
+        char *pBuf = malloc(need);
+        if (!pBuf) { errno = ENOMEM; return -1; }
+
+        size_t len = need;
+        if (sysctl(mib, 6, pBuf, &len, NULL, 0) == 0) {
+            int rc = mentalMapParseRtBuffer(pBuf, len, pOut, cap, pCount, pDropped);
+            free(pBuf);
+            return rc;
+        }
+
+        int saved = errno;
+        free(pBuf);
+        if (saved != ENOMEM) { errno = saved; return -1; }
+        /* table grew between calls: retry once */
+    }
+    errno = ENOMEM;
+    return -1;
+#else
+    (void)pOut; (void)cap; (void)pCount; (void)pDropped;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static inline int mentalMapPrefixFromMask(struct in_addr mask)
+{
+    uint32_t m = ntohl(mask.s_addr);
+    int prefix = 0;
+    while (m & 0x80000000u) {
+        prefix++;
+        m <<= 1;
+    }
+    return prefix;
+}
+
+static inline int mentalMapCollectIfaces(MentalMapIface *pOut, int cap)
+{
+    if (!pOut || cap <= 0) return -1;
+
+    struct ifaddrs *pIfaddr = NULL;
+    if (getifaddrs(&pIfaddr) == -1) return -1;
+
+    int count = 0;
+    for (struct ifaddrs *pIfa = pIfaddr; pIfa; pIfa = pIfa->ifa_next) {
+        if (!pIfa->ifa_addr || !pIfa->ifa_name) continue;
+        if (pIfa->ifa_addr->sa_family != AF_INET) continue;
+        if (pIfa->ifa_flags & IFF_LOOPBACK) continue;
+        if (count >= cap) break;
+
+        struct sockaddr_in *pSin = (struct sockaddr_in *)pIfa->ifa_addr;
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &pSin->sin_addr, ip, sizeof ip)) continue;
+
+        MentalMapIface *pIface = &pOut[count++];
+        memset(pIface, 0, sizeof(*pIface));
+        mentalMapSetString(pIface->name, sizeof(pIface->name), pIfa->ifa_name);
+        mentalMapSetString(pIface->ip, sizeof(pIface->ip), ip);
+        pIface->addr = pSin->sin_addr;
+
+        if (pIfa->ifa_netmask && pIfa->ifa_netmask->sa_family == AF_INET) {
+            struct sockaddr_in *pMask = (struct sockaddr_in *)pIfa->ifa_netmask;
+            pIface->mask = pMask->sin_addr;
+        }
+        pIface->prefix = mentalMapPrefixFromMask(pIface->mask);
+        pIface->flags  = pIfa->ifa_flags;
+    }
+    freeifaddrs(pIfaddr);
+    return count;
+}
+
+#define MENTAL_MAP_SCAN_MAX_HOSTS 512
+
+/* Active ARP scan: probe each host in the local subnet with a one-byte UDP
+ * datagram. The kernel resolves the destination through ARP, which fills the
+ * neighbour table that mentalMapCollectArp() reads afterwards. This needs no
+ * raw sockets and works on Linux, FreeBSD, and macOS. */
+static inline void mentalMapScanSubnets(const MentalMapIface *pIfaces, int count)
+{
+    if (!pIfaces || count <= 0) return;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return;
+
+    const unsigned char probe = 0;
+
+    for (int i = 0; i < count; i++) {
+        uint32_t mask = ntohl(pIfaces[i].mask.s_addr);
+        uint32_t self = ntohl(pIfaces[i].addr.s_addr);
+        if (mask == 0 || mask == 0xFFFFFFFFu) continue;
+
+        /* Only a contiguous run of high bits describes a real subnet. */
+        if ((~mask & (~mask + 1u)) != 0) continue;
+
+        uint32_t net   = self & mask;
+        uint32_t bcast = net | ~mask;
+        if (bcast <= net + 1) continue;
+
+        uint32_t first = net + 1;
+        uint32_t last  = bcast - 1;
+
+        /* Large subnets: probe only the neighbourhood of this host.
+         * Written as a subtraction to stay clear of unsigned overflow. */
+        if (last - first >= MENTAL_MAP_SCAN_MAX_HOSTS) {
+            uint32_t half = MENTAL_MAP_SCAN_MAX_HOSTS / 2;
+            first = (self > net + half) ? self - half : net + 1;
+            last  = first + MENTAL_MAP_SCAN_MAX_HOSTS - 1;
+            if (last >= bcast) {
+                last  = bcast - 1;
+                first = (last > net + MENTAL_MAP_SCAN_MAX_HOSTS)
+                        ? last - MENTAL_MAP_SCAN_MAX_HOSTS + 1
+                        : net + 1;
+            }
+        }
+
+        for (uint32_t addr = first; ; addr++) {
+            if (addr != self) {
+                struct sockaddr_in dst;
+                memset(&dst, 0, sizeof dst);
+                dst.sin_family      = AF_INET;
+                dst.sin_port        = htons(9);
+                dst.sin_addr.s_addr = htonl(addr);
+
+                ssize_t sent = sendto(sock, &probe, sizeof probe, 0,
+                                      (struct sockaddr *)&dst, sizeof dst);
+                if (sent < 0 && (errno == ENOBUFS || errno == EAGAIN)) {
+                    poll(NULL, 0, 1);   /* brief pause, then one retry */
+                    (void)sendto(sock, &probe, sizeof probe, 0,
+                                 (struct sockaddr *)&dst, sizeof dst);
+                }
+            }
+            if (addr == last) break;
+        }
+    }
+
+    close(sock);
+    poll(NULL, 0, 300);   /* let ARP replies populate the kernel table */
+}
+
+static inline int mentalMapDeviceMatches(const MentalMapDevice *pDev,
+                                         const MentalMapIface *pIface)
+{
+    if (pDev->ifname[0] && strcmp(pDev->ifname, pIface->name) == 0)
+        return 1;
+    if (pIface->mask.s_addr == 0) return 0;
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, pDev->ip, &addr) != 1) return 0;
+
+    return (addr.s_addr & pIface->mask.s_addr) ==
+           (pIface->addr.s_addr & pIface->mask.s_addr);
+}
+
+static inline int mentalMapCompareIp(const void *pA, const void *pB)
+{
+    const MentalMapDevice *pDa = (const MentalMapDevice *)pA;
+    const MentalMapDevice *pDb = (const MentalMapDevice *)pB;
+
+    struct in_addr a, b;
+    uint32_t x = 0, y = 0;
+    if (inet_pton(AF_INET, pDa->ip, &a) == 1) x = ntohl(a.s_addr);
+    if (inet_pton(AF_INET, pDb->ip, &b) == 1) y = ntohl(b.s_addr);
+
+    if (x < y) return -1;
+    if (x > y) return  1;
+    return 0;
+}
+
+static inline void mentalMapAppendFlag(char *pBuf, size_t cap, size_t *pOff,
+                                       const char *pText)
+{
+    if (!pBuf || !pOff || *pOff >= cap) return;
+    size_t rem = cap - *pOff;
+    int n = snprintf(pBuf + *pOff, rem, "%s", pText);
+    if (n < 0) return;
+    if ((size_t)n >= rem) {
+        *pOff = cap;      /* buffer is full: later appends must be no-ops */
+        return;
+    }
+    *pOff += (size_t)n;
+}
+
+static inline void mentalMapFlagString(unsigned flags, char *pBuf, size_t cap)
+{
+    if (!pBuf || cap == 0) return;
+    pBuf[0] = '\0';
+
+    size_t off = 0;
+    if (flags & IFF_UP)          mentalMapAppendFlag(pBuf, cap, &off, "UP ");
+    if (flags & IFF_RUNNING)     mentalMapAppendFlag(pBuf, cap, &off, "RUNNING ");
+    if (flags & IFF_BROADCAST)   mentalMapAppendFlag(pBuf, cap, &off, "BROADCAST ");
+    if (flags & IFF_MULTICAST)   mentalMapAppendFlag(pBuf, cap, &off, "MULTICAST ");
+    if (flags & IFF_POINTOPOINT) mentalMapAppendFlag(pBuf, cap, &off, "P2P ");
+
+    size_t len = strlen(pBuf);
+    while (len > 0 && pBuf[len - 1] == ' ') pBuf[--len] = '\0';
+}
+
+static inline void mentalTuiBuiltinMap(MentalTui *tui, int argc, char **argv, void *u)
+{
+    (void)argc; (void)argv; (void)u;
+    if (!tui) return;
+
+    MentalMapIface ifaces[MENTAL_MAP_MAX_IFACES];
+    int iface_count = mentalMapCollectIfaces(ifaces, MENTAL_MAP_MAX_IFACES);
+    int iface_errno = errno;
+    int iface_failed = (iface_count < 0);
+    if (iface_count < 0) iface_count = 0;
+
+    mentalMapScanSubnets(ifaces, iface_count);
+
+    MentalMapDevice devices[MENTAL_MAP_MAX_DEVICES];
+    int count = 0;
+    int dropped = 0;
+
+    for (int i = 0; i < iface_count; i++)
+        mentalMapUpsert(devices, &count, MENTAL_MAP_MAX_DEVICES,
+                        ifaces[i].ip, "", ifaces[i].name,
+                        MENTAL_MAP_SELF, 0, &dropped);
+
+    int arp_count = mentalMapCollectArp(devices, MENTAL_MAP_MAX_DEVICES,
+                                        &count, &dropped);
+    int arp_errno = errno;
+
+    if (tui->p2p && tui->p2p->initialized) {
+        for (int i = 0; i < tui->p2p->peer_count; i++)
+            mentalMapUpsert(devices, &count, MENTAL_MAP_MAX_DEVICES,
+                            tui->p2p->peers[i].ip, "", "",
+                            MENTAL_MAP_PEER, tui->p2p->peers[i].port, &dropped);
+    }
+
+    qsort(devices, (size_t)count, sizeof(devices[0]), mentalMapCompareIp);
+
+    int group[MENTAL_MAP_MAX_DEVICES];
+    int unknown_count = 0;
+    for (int i = 0; i < count; i++) {
+        group[i] = -1;
+        for (int j = 0; j < iface_count; j++) {
+            if (mentalMapDeviceMatches(&devices[i], &ifaces[j])) {
+                group[i] = j;
+                break;
+            }
+        }
+        if (group[i] < 0) unknown_count++;
+    }
+
+    char host[128];
+    if (gethostname(host, sizeof host) != 0)
+        mentalMapSetString(host, sizeof host, "unknown");
+    host[sizeof host - 1] = '\0';
+
+    if (tui->p2p && tui->p2p->initialized)
+        mentalTuiPrintf(tui, MT_BYELLOW,
+                        "Network map - host: %s - p2p: running, %d peer(s)",
+                        host, tui->p2p->peer_count);
+    else
+        mentalTuiPrintf(tui, MT_YELLOW,
+                        "Network map - host: %s - p2p: stopped", host);
+
+    if (iface_failed)
+        mentalTuiPrintf(tui, MT_BRED, "[map] interfaces: %s",
+                        strerror(iface_errno));
+    if (arp_count < 0)
+        mentalTuiPrintf(tui, MT_BRED, "[map] arp: %s", strerror(arp_errno));
+
+    int printed_groups = iface_count + (unknown_count > 0 ? 1 : 0);
+    int group_no = 0;
+
+    for (int j = 0; j < iface_count; j++) {
+        int is_last = (group_no == printed_groups - 1);
+        char flags[96];
+
+        mentalMapFlagString(ifaces[j].flags, flags, sizeof flags);
+        mentalTuiPrintf(tui, MT_YELLOW, "%s- %s  %s/%d  [%s]",
+                        is_last ? "`" : "|", ifaces[j].name, ifaces[j].ip,
+                        ifaces[j].prefix, flags);
+        group_no++;
+
+        int line = 0;
+        for (int i = 0; i < count; i++) {
+            if (group[i] != j) continue;
+
+            const char *pMarker = (devices[i].flags & MENTAL_MAP_PEER) ? "[M]" :
+                                  (devices[i].flags & MENTAL_MAP_SELF) ? "[S]" : "[A]";
+            int color = (devices[i].flags & MENTAL_MAP_PEER) ? MT_BGREEN :
+                        (devices[i].flags & MENTAL_MAP_SELF) ? MT_BCYAN : MT_WHITE;
+
+            char portbuf[16] = {0};
+            if (devices[i].flags & MENTAL_MAP_PEER)
+                snprintf(portbuf, sizeof portbuf, ":%u",
+                         (unsigned)devices[i].port);
+
+            mentalTuiPrintf(tui, color, "%s  %s %-15s %-17s %s",
+                            is_last ? " " : "|", pMarker, devices[i].ip,
+                            devices[i].mac[0] ? devices[i].mac : "-", portbuf);
+            line++;
+        }
+        if (line == 0)
+            mentalTuiPrintf(tui, MT_BBLACK, "%s    (no devices)",
+                            is_last ? " " : "|");
+    }
+
+    if (unknown_count > 0) {
+        mentalTuiPrintf(tui, MT_YELLOW, "`- (unknown)");
+
+        for (int i = 0; i < count; i++) {
+            if (group[i] >= 0) continue;
+
+            const char *pMarker = (devices[i].flags & MENTAL_MAP_PEER) ? "[M]" :
+                                  (devices[i].flags & MENTAL_MAP_SELF) ? "[S]" : "[A]";
+            int color = (devices[i].flags & MENTAL_MAP_PEER) ? MT_BGREEN :
+                        (devices[i].flags & MENTAL_MAP_SELF) ? MT_BCYAN : MT_WHITE;
+
+            char portbuf[16] = {0};
+            if (devices[i].flags & MENTAL_MAP_PEER)
+                snprintf(portbuf, sizeof portbuf, ":%u",
+                         (unsigned)devices[i].port);
+
+            mentalTuiPrintf(tui, color, "   %s %-15s %-17s %s",
+                            pMarker, devices[i].ip,
+                            devices[i].mac[0] ? devices[i].mac : "-", portbuf);
+        }
+    }
+
+    mentalTuiPrintf(tui, MT_BBLACK, "");
+    mentalTuiPrintf(tui, MT_BBLACK,
+                    "[S] this host   [M] mental peer   [A] arp entry");
+    mentalTuiPrintf(tui, MT_BBLACK, "devices: %d / limit %d",
+                    count, MENTAL_MAP_MAX_DEVICES);
+    if (dropped > 0)
+        mentalTuiPrintf(tui, MT_BBLACK, "... %d more device(s) not shown", dropped);
 }
 
 /* ============================================================
@@ -1987,7 +1822,7 @@ static inline void mentalTuiBuiltinNetInfo(MentalTui *tui, int argc, char **argv
 static inline void mentalTuiBuiltinHelp(MentalTui *tui, int argc, char **argv, void *u)
 {
     (void)argc; (void)argv; (void)u;
-    mentalTuiPrintf(tui, MT_YELLOW, "Commands:");
+    mentalTuiPrintf(tui, MT_BYELLOW, "Commands:");
     for (int i = 0; i < tui->cmd_count; i++)
         mentalTuiPrintf(tui, MT_WHITE, "  %-12s %s",
                         tui->cmds[i].name,
@@ -2042,6 +1877,7 @@ static inline void mentalTuiShowFreebsdIco(MentalTui *tui, int argc, char **argv
     mentalTuiPrintf(tui, MT_BBLACK, "");
 }
 
+/* ---- P2P TUI commands ------------------------------------------- */
 static inline void mentalTuiBuiltinP2PStart(MentalTui *tui, int argc, char **argv, void *u)
 {
     (void)argc; (void)argv; (void)u;
@@ -2079,7 +1915,6 @@ static inline void mentalTuiBuiltinP2PStop(MentalTui *tui, int argc, char **argv
     }
 
     int peers = tui->p2p->peer_count;
-    tui->p2p->tui_owner = NULL;
     mentalP2PDestroy(tui->p2p);
     tui->p2p            = NULL;
     tui->p2p_sink_ready = 0;
@@ -2112,7 +1947,7 @@ static inline void mentalTuiBuiltinPing(MentalTui *tui, int argc, char **argv, v
     (void)argc; (void)argv; (void)u;
     if (!tui->p2p || !tui->p2p->initialized) {
         mentalTuiPrintf(tui, MT_BYELLOW,
-                        "[p2p] not running - try 'p2p-start' first");
+                        "[p2p] not running — try 'p2p-start' first");
         return;
     }
     int n = mentalP2PPing(tui->p2p);
@@ -2129,7 +1964,7 @@ static inline void mentalTuiBuiltinConnect(MentalTui *tui, int argc, char **argv
     }
     if (!tui->p2p || !tui->p2p->initialized) {
         mentalTuiPrintf(tui, MT_BYELLOW,
-                        "[p2p] not running - try 'p2p-start' first");
+                        "[p2p] not running — try 'p2p-start' first");
         return;
     }
     mentalP2PConnect(tui->p2p, argv[1]);
@@ -2140,13 +1975,13 @@ static inline void mentalTuiBuiltinPeers(MentalTui *tui, int argc, char **argv, 
     (void)argc; (void)argv; (void)u;
     if (!tui->p2p || !tui->p2p->initialized) {
         mentalTuiPrintf(tui, MT_BYELLOW,
-                        "[p2p] not running - try 'p2p-start' first");
+                        "[p2p] not running — try 'p2p-start' first");
         return;
     }
     mentalTuiPrintf(tui, MT_BYELLOW, "---- Known Peers (%d/%d) ----",
                     tui->p2p->peer_count, P2P_MAX_PEERS);
     if (tui->p2p->peer_count == 0) {
-        mentalTuiPrintf(tui, MT_BBLACK, "  (none - try 'ping')");
+        mentalTuiPrintf(tui, MT_BBLACK, "  (none — try 'ping')");
     } else {
         for (int i = 0; i < tui->p2p->peer_count; i++) {
             mentalTuiPrintf(tui, MT_WHITE, "  %2d. %s:%u", i + 1,
@@ -2166,117 +2001,6 @@ static inline void mentalTuiBuiltinExit(MentalTui *tui, int argc, char **argv, v
     tui->running = 0;
 }
 
-/* ---- Auth-related builtins ---- */
-static inline void mentalTuiBuiltinWhoami(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)argc; (void)argv; (void)u;
-    mentalTuiPrintf(tui, MT_BGREEN, "user: %s",
-                    tui->auth.username[0] ? tui->auth.username : "(unknown)");
-    if (tui->auth.store) {
-        mentalTuiPrintf(tui, MT_WHITE, "  store: %s", tui->auth.store->file_path);
-        mentalTuiPrintf(tui, MT_WHITE, "  users: %d / %d",
-                        tui->auth.store->user_count, MENTAL_AUTH_MAX_USERS);
-    }
-}
-
-static inline void mentalTuiBuiltinUsers(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)argc; (void)argv; (void)u;
-    if (!tui->auth.store) return;
-    mentalTuiPrintf(tui, MT_BYELLOW, "---- Registered Users ----");
-    for (int i = 0; i < MENTAL_AUTH_MAX_USERS; i++) {
-        if (!tui->auth.store->users[i].used) continue;
-        mentalTuiPrintf(tui, MT_WHITE, "  - %s", tui->auth.store->users[i].username);
-    }
-}
-
-static inline void mentalTuiBuiltinLogout(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)argc; (void)argv; (void)u;
-    tui->authenticated = 0;
-    tui->auth.attempts = 0;
-    mentalTuiAuthReset(tui, 0);
-}
-
-static inline void mentalTuiBuiltinPasswd(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)argc; (void)argv; (void)u;
-    mentalTuiPrintf(tui, MT_YELLOW,
-                    "passwd is not yet implemented in-TUI; "
-                    "credential file: %s",
-                    tui->auth.store ? tui->auth.store->file_path : "(none)");
-}
-
-/* ---- Plugin builtins ---- */
-static inline void mentalTuiBuiltinPluginLoad(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)u;
-    if (argc < 2) { mentalTuiPrintf(tui, MT_YELLOW, "usage: plugin-load <path.so>"); return; }
-    if (!tui->plugins) { mentalTuiPrintf(tui, MT_BRED, "plugin system disabled"); return; }
-    char err[256] = {0};
-    if (mentalPluginLoad(tui->plugins, argv[1], err, sizeof err) == 0)
-        mentalTuiPrintf(tui, MT_BGREEN, "[plugin] loaded %s", argv[1]);
-    else
-        mentalTuiPrintf(tui, MT_BRED, "[plugin] %s", err);
-}
-
-static inline void mentalTuiBuiltinPluginUnload(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)u;
-    if (argc < 2) { mentalTuiPrintf(tui, MT_YELLOW, "usage: plugin-unload <name>"); return; }
-    if (!tui->plugins) { mentalTuiPrintf(tui, MT_BRED, "plugin system disabled"); return; }
-    char err[256] = {0};
-    if (mentalPluginUnload(tui->plugins, argv[1], err, sizeof err) == 0)
-        mentalTuiPrintf(tui, MT_BGREEN, "[plugin] unloaded %s", argv[1]);
-    else
-        mentalTuiPrintf(tui, MT_BRED, "[plugin] %s", err);
-}
-
-static inline void mentalTuiBuiltinPluginList(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)argc; (void)argv; (void)u;
-    if (!tui->plugins || tui->plugins->count == 0) {
-        mentalTuiPrintf(tui, MT_BBLACK, "(no plugins loaded)");
-        return;
-    }
-    mentalTuiPrintf(tui, MT_BYELLOW, "---- Loaded Plugins (%d/%d) ----",
-                    tui->plugins->count, MENTAL_PLUGIN_MAX);
-    for (int i = 0; i < tui->plugins->count; i++) {
-        MentalPlugin *p = tui->plugins->plugins[i];
-        mentalTuiPrintf(tui, MT_WHITE, "  %-16s v%-8s %s",
-                        p->name, p->version ? p->version : "?",
-                        p->description ? p->description : "");
-    }
-}
-
-static inline void mentalTuiBuiltinPluginInfo(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)u;
-    if (argc < 2) { mentalTuiPrintf(tui, MT_YELLOW, "usage: plugin-info <name>"); return; }
-    MentalPlugin *p = mentalPluginFind(tui->plugins, argv[1]);
-    if (!p) { mentalTuiPrintf(tui, MT_BRED, "plugin '%s' not loaded", argv[1]); return; }
-    mentalTuiPrintf(tui, MT_BYELLOW, "Plugin: %s", p->name);
-    mentalTuiPrintf(tui, MT_WHITE, "  version : %s", p->version ? p->version : "?");
-    mentalTuiPrintf(tui, MT_WHITE, "  desc    : %s", p->description ? p->description : "");
-    mentalTuiPrintf(tui, MT_WHITE, "  abi     : %d (host %d)", p->abi_version, MENTAL_PLUGIN_ABI_VERSION);
-    mentalTuiPrintf(tui, MT_WHITE, "  handle  : %p", p->handle);
-    mentalTuiPrintf(tui, MT_WHITE, "  active  : %s", p->active ? "yes" : "no");
-}
-
-static inline void mentalTuiBuiltinPluginLoadAll(MentalTui *tui, int argc, char **argv, void *u)
-{
-    (void)u;
-    if (argc < 2) { mentalTuiPrintf(tui, MT_YELLOW, "usage: plugin-load-all <dir>"); return; }
-    if (!tui->plugins) { mentalTuiPrintf(tui, MT_BRED, "plugin system disabled"); return; }
-    char err[256] = {0};
-    int n = mentalPluginLoadDir(tui->plugins, argv[1], err, sizeof err);
-    if (n < 0)
-        mentalTuiPrintf(tui, MT_BRED, "[plugin] %s", err);
-    else
-        mentalTuiPrintf(tui, MT_BGREEN, "[plugin] loaded %d plugin(s) from %s",
-                        n, argv[1]);
-}
-
 static inline void mentalTuiRegisterBuiltins(MentalTui *tui)
 {
     mentalTuiRegister(tui, "freebsd",    "show freebsd ascii logo",  mentalTuiShowFreebsdIco,   NULL);
@@ -2289,17 +2013,8 @@ static inline void mentalTuiRegisterBuiltins(MentalTui *tui)
     mentalTuiRegister(tui, "ping",       "broadcast P2P discovery",  mentalTuiBuiltinPing,      NULL);
     mentalTuiRegister(tui, "connect",    "connect <ip> (unicast)",   mentalTuiBuiltinConnect,   NULL);
     mentalTuiRegister(tui, "peers",      "list known P2P peers",     mentalTuiBuiltinPeers,     NULL);
-
-    mentalTuiRegister(tui, "whoami",     "show current user",        mentalTuiBuiltinWhoami,    NULL);
-    mentalTuiRegister(tui, "users",      "list registered users",    mentalTuiBuiltinUsers,     NULL);
-    mentalTuiRegister(tui, "passwd",     "change password (stub)",    mentalTuiBuiltinPasswd,    NULL);
-    mentalTuiRegister(tui, "logout",     "log out and return to login", mentalTuiBuiltinLogout, NULL);
-
-    mentalTuiRegister(tui, "plugin-load",     "plugin-load <path.so>",  mentalTuiBuiltinPluginLoad,     NULL);
-    mentalTuiRegister(tui, "plugin-load-all", "plugin-load-all <dir>",  mentalTuiBuiltinPluginLoadAll,  NULL);
-    mentalTuiRegister(tui, "plugin-unload",   "plugin-unload <name>",   mentalTuiBuiltinPluginUnload,   NULL);
-    mentalTuiRegister(tui, "plugin-list",     "list loaded plugins",    mentalTuiBuiltinPluginList,     NULL);
-    mentalTuiRegister(tui, "plugin-info",     "plugin-info <name>",     mentalTuiBuiltinPluginInfo,     NULL);
+    mentalTuiRegister(tui, "map",        "show network map (interfaces, peers, arp)",
+                                        mentalTuiBuiltinMap,       NULL);
 
     mentalTuiRegister(tui, "help",       "list commands",            mentalTuiBuiltinHelp,      NULL);
     mentalTuiRegister(tui, "clear",      "clear output",             mentalTuiBuiltinClear,     NULL);
@@ -2321,6 +2036,9 @@ typedef struct MentalInstance {
     MentalP2PServer    *pP2P;
 } MentalInstance;
 
+/* Called by the TUI whenever P2P is created or destroyed.
+ * Keeps MentalInstance::pP2P live without the TUI having to
+ * know the layout of MentalInstance. */
 static inline void mental_instance_p2p_notify(void *ctx, MentalP2PServer *srv)
 {
     MentalInstance *inst = (MentalInstance *)ctx;
@@ -2345,6 +2063,7 @@ static inline enum MentalResult mental_instance_create(MentalInstance *pInstance
         pInstance->pTui = tui;
         mentalTuiRun(tui);
 
+        /* Session ended: mirror final TUI P2P state outward. */
         pInstance->pP2P = tui->p2p;
     }
     return MENTAL_RESULT_TYPE_OK;
@@ -2356,7 +2075,6 @@ static inline void mental_instance_destroy(MentalInstance *pInstance)
 
     if (pInstance->pTui) {
         if (pInstance->pTui->p2p) {
-            pInstance->pTui->p2p->tui_owner = NULL;
             mentalP2PDestroy(pInstance->pTui->p2p);
             pInstance->pTui->p2p = NULL;
         }
@@ -2389,13 +2107,13 @@ int  mental_logger_initialize(const char *pLogFilePath);
 void mental_logger_destroy(void);
 void mental_logger_flush(void);
 
-int __mental_logger_write_impl(const char *pFunc, const char *pFmt, va_list args);
-int __mental_logger_write(const char *pFunc, const char *pFmt, ...);
-int __mental_logger_write_fl(const char *pFile, int line,
-                             const char *pFunc, const char *pFmt, ...);
+int mental_logger_write_impl(const char *pFunc, const char *pFmt, va_list args);
+int mental_logger_write(const char *pFunc, const char *pFmt, ...);
+int mental_logger_write_fl(const char *pFile, int line,
+                           const char *pFunc, const char *pFmt, ...);
 
-#define log(...)  __mental_logger_write(__func__, __VA_ARGS__)
-#define logf(...) __mental_logger_write_fl(__FILE__, __LINE__, __func__, __VA_ARGS__)
+#define MENTAL_LOG(...)  mental_logger_write(__func__, __VA_ARGS__)
+#define MENTAL_LOGF(...) mental_logger_write_fl(__FILE__, __LINE__, __func__, __VA_ARGS__)
 
 /* ============================================================
  *  Window manager / GL (declarations only)
