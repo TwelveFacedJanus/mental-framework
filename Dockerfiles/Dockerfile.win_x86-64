@@ -1,0 +1,13 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install \
+    cmake \
+    pkg-config \
+    make \
+    g++-mingw-w64-x86-64 \
+    ca-certificates
+
+WORKDIR /mental-workdir
